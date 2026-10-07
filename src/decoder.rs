@@ -685,6 +685,9 @@ mod registry {
     pub struct Vp8Decoder {
         codec_id: CodecId,
         pending: VecDeque<Packet>,
+        /// Size of the frame `receive_frame` last returned (frames are
+        /// decoded there, so none is known before it).
+        last_output: Option<(u32, u32)>,
         eof: bool,
         state: crate::state::Vp8DecoderState,
     }
@@ -700,6 +703,7 @@ mod registry {
             Self {
                 codec_id,
                 pending: VecDeque::new(),
+                last_output: None,
                 eof: false,
                 state: crate::state::Vp8DecoderState::new(),
             }
@@ -716,6 +720,7 @@ mod registry {
             Self {
                 codec_id,
                 pending: VecDeque::new(),
+                last_output: None,
                 eof: false,
                 state: crate::state::Vp8DecoderState::new()
                     .with_max_pixels_per_frame(limits.max_pixels_per_frame),
@@ -752,9 +757,19 @@ mod registry {
                 };
             };
             let decoded = self.state.decode_frame(&pkt.data)?;
+            self.last_output = Some((decoded.width, decoded.height));
             let mut vf: VideoFrame = decoded.into();
             vf.pts = pkt.pts;
             Ok(Frame::Video(vf))
+        }
+
+        /// The §9.1 frame size of the frame last returned.
+        fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+            self.last_output
+        }
+
+        fn output_pixel_format(&self) -> Option<PixelFormat> {
+            self.last_output.map(|_| PixelFormat::Yuv420P)
         }
 
         fn flush(&mut self) -> Result<()> {
@@ -764,6 +779,7 @@ mod registry {
 
         fn reset(&mut self) -> Result<()> {
             self.pending.clear();
+            self.last_output = None;
             self.eof = false;
             self.state = crate::state::Vp8DecoderState::new();
             Ok(())

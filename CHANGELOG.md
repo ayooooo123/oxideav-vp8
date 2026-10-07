@@ -4,6 +4,13 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- The registry decoder implements `Decoder::output_video_dimensions` /
+  `output_pixel_format`: the §9.1 frame size of the frame `receive_frame`
+  last returned, `Yuv420P`. A key frame of a new size is reported when it
+  is returned.
+
 ## [0.2.7](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.6...v0.2.7) - 2026-08-24
 
 ### Other
