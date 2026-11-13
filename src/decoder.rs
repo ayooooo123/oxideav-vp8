@@ -48,17 +48,18 @@
 
 use crate::bool_decoder::BoolDecoder;
 use crate::coded_header::{CodedHeaderError, Vp8CodedHeader};
-use crate::dct_tokens::{merge_default_token_probs, CoeffProbs, MbCoeffError, MbEntropyCtx};
-use crate::dequant::{decode_and_dequantize_mb, MbDequantFactors};
-use crate::frame::{decode_keyframe, FrameError, KeyframePlanes, MbCoeffs};
+use crate::dct_tokens::{CoeffProbs, MbCoeffError, MbEntropyCtx, merge_default_token_probs};
+use crate::dequant::{MbDequantFactors, decode_and_dequantize_mb};
+use crate::frame::{FrameError, KeyframePlanes, MbCoeffs, decode_keyframe};
 use crate::frame_header::{FrameHeaderError, Vp8FrameHeader};
-use crate::loop_filter::{filter_frame, FrameFilterConfig, MAX_MB_SEGMENTS};
+use crate::loop_filter::{FrameFilterConfig, MAX_MB_SEGMENTS, filter_frame};
 use crate::macroblock::{
-    parse_key_frame_macroblock_modes, IntraYMode, MacroblockError, MacroblockModes,
+    IntraYMode, MacroblockError, MacroblockModes, parse_key_frame_macroblock_modes,
 };
 
 /// Errors surfaced by [`decode_vp8`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecodeError {
     /// The §9.1 uncompressed header could not be parsed.
     FrameHeader(FrameHeaderError),
@@ -237,7 +238,7 @@ impl From<crate::near_mv::InterMbError> for DecodeError {
 /// (`uv_width = (width + 1) / 2`, `uv_height = (height + 1) / 2`). Decode
 /// pads internally to whole macroblocks; the §15 loop filter runs against
 /// that padded buffer, then this output is cropped to the visible area.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Vp8DecodedFrame {
     /// Visible width in luma pixels (the §9.1 key-frame `width`).
     pub width: u32,
@@ -249,6 +250,43 @@ pub struct Vp8DecodedFrame {
     pub u: Vec<u8>,
     /// V chroma plane — same dimensions as `u`.
     pub v: Vec<u8>,
+}
+
+impl Vp8DecodedFrame {
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `y`.
+    #[must_use]
+    pub fn with_y(mut self, v: Vec<u8>) -> Self {
+        self.y = v;
+        self
+    }
+
+    /// Set `u`.
+    #[must_use]
+    pub fn with_u(mut self, v: Vec<u8>) -> Self {
+        self.u = v;
+        self
+    }
+
+    /// Set `v`.
+    #[must_use]
+    pub fn with_v(mut self, v: Vec<u8>) -> Self {
+        self.v = v;
+        self
+    }
 }
 
 /// Decode one VP8 frame end-to-end and emit the reconstructed I420 picture.
@@ -437,16 +475,16 @@ pub(crate) fn carve_dct_partitions(
 fn resolve_segment_dequant_factors(coded: &Vp8CodedHeader) -> [MbDequantFactors; MAX_MB_SEGMENTS] {
     let base = MbDequantFactors::from_quant_indices(&coded.quant_indices);
     let mut out = [base; MAX_MB_SEGMENTS];
-    if coded.segmentation_enabled {
-        if let Some(seg) = coded.update_segmentation {
-            for (i, slot) in out.iter_mut().enumerate() {
-                let qval = seg.quantizer_update[i].unwrap_or(0) as i32;
-                *slot = MbDequantFactors::for_segment(
-                    &coded.quant_indices,
-                    qval,
-                    seg.segment_feature_mode_absolute,
-                );
-            }
+    if coded.segmentation_enabled
+        && let Some(seg) = coded.update_segmentation
+    {
+        for (i, slot) in out.iter_mut().enumerate() {
+            let qval = seg.quantizer_update[i].unwrap_or(0) as i32;
+            *slot = MbDequantFactors::for_segment(
+                &coded.quant_indices,
+                qval,
+                seg.segment_feature_mode_absolute,
+            );
         }
     }
     out
@@ -617,8 +655,9 @@ mod registry {
 
     use oxideav_core::frame::VideoPlane;
     use oxideav_core::{
-        CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, Decoder,
-        DecoderLimits, Error, Frame, Packet, PixelFormat, Result, RuntimeContext, VideoFrame,
+        CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag,
+        ColorSignal, Decoder, DecoderLimits, Error, Frame, MatrixCoefficients, Packet, PixelFormat,
+        Result, RuntimeContext, VideoFrame,
     };
 
     use super::{DecodeError, Vp8DecodedFrame};
@@ -673,23 +712,142 @@ mod registry {
 
     /// `oxideav_core::Decoder` impl driving [`Vp8DecoderState`].
     ///
-    /// Each `send_packet` queues one compressed packet; the next
-    /// `receive_frame` consumes it and feeds it to
+    /// Each `send_packet` queues one compressed packet; `receive_frame`
+    /// consumes queued packets and feeds them to
     /// [`Vp8DecoderState::decode_frame`], which threads reference frames
     /// and entropy carry-state across calls. Both key frames and
     /// interframes decode end-to-end; the only `DecodeError::Unsupported`
     /// returned now is "interframe arrived before any key frame" (a
     /// stream-mis-feed error, not a missing feature).
     ///
+    /// ## Invisible frames
+    ///
+    /// A frame whose §9.1 `show_frame` bit is 0 is "not for display": it
+    /// is decoded (its §9.7 / §9.8 reference-slot side effects apply) but
+    /// no picture is returned for it — `receive_frame` moves on to the
+    /// next queued packet, and answers [`Error::NeedMore`] when that was
+    /// the last one. Only shown pictures reach the caller.
+    ///
+    /// ## Stream parameters
+    ///
+    /// [`Decoder::output_params`] answers the resolved description of
+    /// the pictures this decoder returns: the §9.1 visible `width` /
+    /// `height` (the cropped size of the emitted planes, not the
+    /// macroblock-aligned one), [`PixelFormat::Yuv420P`], and the §9.2
+    /// `color_space` as the colour signal's matrix. Before the first
+    /// picture it answers from the key frame already decoded, else from
+    /// the first queued key frame's headers.
+    ///
+    /// Only a key frame can change that description (§9.1 / §9.2 are
+    /// key-frame-only fields). When the first **shown** picture of a new
+    /// description is about to be returned, the decoder bumps
+    /// [`Decoder::output_params_generation`] and returns one
+    /// [`Frame::StreamParams`] event carrying the new `output_params()`
+    /// first; the picture follows on the next call. No event is
+    /// returned for the first description, for a key frame that repeats
+    /// the current one, or for an invisible key frame (the event waits
+    /// for the first shown picture of the new size). [`Decoder::reset`]
+    /// keeps the description of the last picture returned, so a seek
+    /// into a segment of a different size announces it the same way.
+    ///
+    /// The §9.1 upscale codes and the §9.2 `clamping_type` bit do not
+    /// change the emitted planes and are not part of the description;
+    /// [`Vp8Decoder::upscale`] / [`Vp8Decoder::clamping_type`] expose
+    /// them.
+    ///
+    /// The decoder runs serially; it keeps the default no-op
+    /// [`Decoder::set_execution_context`].
+    ///
     /// [`Vp8DecoderState::decode_frame`]: crate::state::Vp8DecoderState::decode_frame
     pub struct Vp8Decoder {
         codec_id: CodecId,
         pending: VecDeque<Packet>,
-        /// Size of the frame `receive_frame` last returned (frames are
-        /// decoded there, so none is known before it).
-        last_output: Option<(u32, u32)>,
         eof: bool,
         state: crate::state::Vp8DecoderState,
+        /// Description of the picture most recently returned (`None`
+        /// until the first one).
+        shape: Option<OutputShape>,
+        /// [`Decoder::output_params_generation`] counter: bumped once per
+        /// mid-stream change of `shape`.
+        generation: u64,
+        /// The first picture of a new shape, held back behind the
+        /// [`Frame::StreamParams`] event just returned for it, with the
+        /// shape it was decoded at.
+        held: Option<(OutputShape, VideoFrame)>,
+        /// §9.1 frame size of the picture `receive_frame` last **returned**
+        /// (`None` until the first one). Set when the picture is handed
+        /// out, so a [`Frame::StreamParams`] event that announces the next
+        /// size does not change it.
+        last_output: Option<(u32, u32)>,
+    }
+
+    /// The part of the decoder's output that [`Decoder::output_params`]
+    /// describes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct OutputShape {
+        width: u32,
+        height: u32,
+        /// §9.2 `color_space` bit (`false` = BT.601-like YUV).
+        color_space_reserved: bool,
+    }
+
+    impl OutputShape {
+        /// §9.2 `color_space` → colour signal. Value 0 is "YUV color
+        /// space similar to the YCrCb color space defined in
+        /// [ITU-R_BT.601]": the BT.601 luma / chroma matrix (H.273
+        /// matrix code points 5 and 6 are the same matrix; 6 is used).
+        /// §9.2 states no primaries, transfer or nominal range, so those
+        /// stay unspecified; value 1 is reserved and states nothing.
+        fn color_signal(self) -> ColorSignal {
+            let mut signal = ColorSignal::unspecified();
+            if !self.color_space_reserved {
+                signal.matrix = MatrixCoefficients::BT601_525;
+            }
+            signal
+        }
+
+        fn to_params(self, codec_id: &CodecId) -> CodecParameters {
+            let mut p = CodecParameters::video(codec_id.clone());
+            p.width = Some(self.width);
+            p.height = Some(self.height);
+            p.pixel_format = Some(PixelFormat::Yuv420P);
+            p.color_signal = self.color_signal();
+            p
+        }
+
+        /// The shape the state's most recent key frame installed.
+        fn from_state(state: &crate::state::Vp8DecoderState) -> Option<Self> {
+            Some(Self {
+                width: state.visible_width()?,
+                height: state.visible_height()?,
+                color_space_reserved: state.color_space()?,
+            })
+        }
+
+        /// Read the shape straight off a key frame's §9.1 uncompressed
+        /// header and the first bit of its §9.2 / §19.2 first partition,
+        /// without decoding it. `None` for an interframe or a header
+        /// that does not parse.
+        fn peek_key_frame(bytes: &[u8]) -> Option<Self> {
+            let header = crate::frame_header::Vp8FrameHeader::parse(bytes).ok()?;
+            if !header.key_frame {
+                return None;
+            }
+            let width = u32::from(header.width?);
+            let height = u32::from(header.height?);
+            if width == 0 || height == 0 {
+                return None;
+            }
+            let first = bytes.get(header.header_bytes_consumed..)?;
+            let first = &first[..first.len().min(header.first_partition_size as usize)];
+            let mut bd = crate::bool_decoder::BoolDecoder::init(first).ok()?;
+            let color_space_reserved = bd.read_literal(1).ok()? != 0;
+            Some(Self {
+                width,
+                height,
+                color_space_reserved,
+            })
+        }
     }
 
     impl Vp8Decoder {
@@ -700,13 +858,7 @@ mod registry {
         ///
         /// [`Vp8DecoderState`]: crate::state::Vp8DecoderState
         pub fn new(codec_id: CodecId) -> Self {
-            Self {
-                codec_id,
-                pending: VecDeque::new(),
-                last_output: None,
-                eof: false,
-                state: crate::state::Vp8DecoderState::new(),
-            }
+            Self::with_state(codec_id, crate::state::Vp8DecoderState::new())
         }
 
         /// Build a decoder that enforces `limits.max_pixels_per_frame` as
@@ -715,16 +867,45 @@ mod registry {
         /// [`Error::ResourceExhausted`] before the decoder allocates its
         /// macroblock grid. Constructed by [`make_decoder`] from the
         /// [`CodecParameters::limits`](oxideav_core::CodecParameters) the
-        /// registry threads in.
+        /// registry threads in. The cap survives [`Decoder::reset`].
         pub fn with_limits(codec_id: CodecId, limits: DecoderLimits) -> Self {
+            Self::with_state(
+                codec_id,
+                crate::state::Vp8DecoderState::new()
+                    .with_max_pixels_per_frame(limits.max_pixels_per_frame),
+            )
+        }
+
+        fn with_state(codec_id: CodecId, state: crate::state::Vp8DecoderState) -> Self {
             Self {
                 codec_id,
                 pending: VecDeque::new(),
-                last_output: None,
                 eof: false,
-                state: crate::state::Vp8DecoderState::new()
-                    .with_max_pixels_per_frame(limits.max_pixels_per_frame),
+                state,
+                shape: None,
+                generation: 0,
+                held: None,
+                last_output: None,
             }
+        }
+
+        /// §9.1 `(horizontal_scale, vertical_scale)` upscale codes of the
+        /// most recently decoded key frame — a display hint that does not
+        /// change the emitted planes. `None` before any key frame.
+        pub fn upscale(
+            &self,
+        ) -> Option<(
+            crate::frame_header::ScaleCode,
+            crate::frame_header::ScaleCode,
+        )> {
+            self.state.upscale()
+        }
+
+        /// §9.2 `clamping_type` bit of the most recently decoded key
+        /// frame (`Some(true)` = the encoder guarantees in-range pixels).
+        /// `None` before any key frame.
+        pub fn clamping_type(&self) -> Option<bool> {
+            self.state.clamping_type()
         }
     }
 
@@ -734,6 +915,8 @@ mod registry {
                 .field("codec_id", &self.codec_id)
                 .field("pending", &self.pending.len())
                 .field("eof", &self.eof)
+                .field("shape", &self.shape)
+                .field("generation", &self.generation)
                 .finish()
         }
     }
@@ -749,27 +932,43 @@ mod registry {
         }
 
         fn receive_frame(&mut self) -> Result<Frame> {
-            let Some(pkt) = self.pending.pop_front() else {
-                return if self.eof {
-                    Err(Error::Eof)
-                } else {
-                    Err(Error::NeedMore)
+            if let Some((shape, vf)) = self.held.take() {
+                self.last_output = Some((shape.width, shape.height));
+                return Ok(Frame::Video(vf));
+            }
+            loop {
+                let Some(pkt) = self.pending.pop_front() else {
+                    return if self.eof {
+                        Err(Error::Eof)
+                    } else {
+                        Err(Error::NeedMore)
+                    };
                 };
-            };
-            let decoded = self.state.decode_frame(&pkt.data)?;
-            self.last_output = Some((decoded.width, decoded.height));
-            let mut vf: VideoFrame = decoded.into();
-            vf.pts = pkt.pts;
-            Ok(Frame::Video(vf))
-        }
-
-        /// The §9.1 frame size of the frame last returned.
-        fn output_video_dimensions(&self) -> Option<(u32, u32)> {
-            self.last_output
-        }
-
-        fn output_pixel_format(&self) -> Option<PixelFormat> {
-            self.last_output.map(|_| PixelFormat::Yuv420P)
+                let decoded = self.state.decode_frame(&pkt.data)?;
+                if self.state.last_frame_shown() == Some(false) {
+                    // §9.1 show_frame = 0: reference-only, not for display.
+                    continue;
+                }
+                let shape = OutputShape::from_state(&self.state)
+                    .expect("a decoded frame implies a decoded key frame");
+                let mut vf: VideoFrame = decoded.into();
+                vf.pts = pkt.pts;
+                return match self.shape {
+                    Some(current) if current != shape => {
+                        self.shape = Some(shape);
+                        self.generation = self.generation.wrapping_add(1);
+                        self.held = Some((shape, vf));
+                        Ok(Frame::StreamParams(Box::new(
+                            shape.to_params(&self.codec_id),
+                        )))
+                    }
+                    _ => {
+                        self.shape = Some(shape);
+                        self.last_output = Some((shape.width, shape.height));
+                        Ok(Frame::Video(vf))
+                    }
+                };
+            }
         }
 
         fn flush(&mut self) -> Result<()> {
@@ -779,10 +978,46 @@ mod registry {
 
         fn reset(&mut self) -> Result<()> {
             self.pending.clear();
+            self.held = None;
             self.last_output = None;
             self.eof = false;
-            self.state = crate::state::Vp8DecoderState::new();
+            let cap = self.state.max_pixels_per_frame();
+            self.state = crate::state::Vp8DecoderState::new().with_max_pixels_per_frame(cap);
+            // `shape` / `generation` are kept: the next picture is
+            // compared against the last one returned before the reset.
             Ok(())
+        }
+
+        /// The §9.1 frame size of the picture `receive_frame` last
+        /// returned; `None` until the first one. A [`Frame::StreamParams`]
+        /// event announces a new size ahead of its picture, so this keeps
+        /// answering the previous picture's size until that picture is
+        /// returned.
+        fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+            self.last_output
+        }
+
+        fn output_pixel_format(&self) -> Option<PixelFormat> {
+            self.output_params().and_then(|p| p.pixel_format)
+        }
+
+        fn output_params(&self) -> Option<CodecParameters> {
+            // The last picture returned; before the first one, the key
+            // frame already decoded (an invisible one returns no picture),
+            // else the first queued key frame's headers.
+            let shape = self
+                .shape
+                .or_else(|| OutputShape::from_state(&self.state))
+                .or_else(|| {
+                    self.pending
+                        .iter()
+                        .find_map(|p| OutputShape::peek_key_frame(&p.data))
+                })?;
+            Some(shape.to_params(&self.codec_id))
+        }
+
+        fn output_params_generation(&self) -> u64 {
+            self.generation
         }
     }
 
@@ -809,6 +1044,8 @@ mod registry {
             CodecInfo::new(CodecId::new(VP8_CODEC_ID))
                 .capabilities(caps)
                 .decoder(make_decoder)
+                .encoder(crate::encoder::make_encoder_from_param_options)
+                .encoder_options::<crate::encoder::Vp8EncoderOptions>()
                 .tags([
                     CodecTag::fourcc(b"VP80"),
                     CodecTag::fourcc(b"vp08"),
@@ -833,7 +1070,7 @@ mod registry {
 
 #[cfg(feature = "registry")]
 pub use registry::{
-    make_decoder, output_pixel_format, register, register_codecs, Vp8Decoder, VP8_CODEC_ID,
+    VP8_CODEC_ID, Vp8Decoder, make_decoder, output_pixel_format, register, register_codecs,
 };
 
 // ───────────────────────────── tests ────────────────────────────────

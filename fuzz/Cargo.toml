@@ -2,7 +2,7 @@
 name = "oxideav-vp8-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 
 [package.metadata]
 cargo-fuzz = true
@@ -859,6 +859,18 @@ doc = false
 [[bin]]
 name = "encode_decode_pixel_lockstep"
 path = "fuzz_targets/encode_decode_pixel_lockstep.rs"
+test = false
+doc = false
+
+# Round 486 — key-frame encode options: the `EncodeEffort` level and the
+# macroblock-row wavefront thread budget (plus the auto loop-filter /
+# fitted token-probability switches) through
+# `encode_keyframe_with_reconstruction_and_options`. Oracles: threaded
+# bytes + reconstruction == serial, `decode_vp8` == the encoder's
+# reconstruction at every level, default options == `encode_keyframe`.
+[[bin]]
+name = "keyframe_effort_threads_lockstep"
+path = "fuzz_targets/keyframe_effort_threads_lockstep.rs"
 test = false
 doc = false
 

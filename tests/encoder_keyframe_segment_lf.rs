@@ -25,9 +25,9 @@ use std::io::Write as _;
 use std::process::{Command, Stdio};
 
 use oxideav_vp8::{
-    decode_vp8, encode_keyframe_adaptive_quant_with_reconstruction,
-    encode_keyframe_adaptive_quant_with_segment_lf_deltas, AdaptiveQuantConfig, EncodeError,
-    I420Frame, Vp8CodedHeader, Vp8FrameHeader,
+    AdaptiveQuantConfig, EncodeError, I420Frame, Vp8CodedHeader, Vp8FrameHeader, decode_vp8,
+    encode_keyframe_adaptive_quant_with_reconstruction,
+    encode_keyframe_adaptive_quant_with_segment_lf_deltas,
 };
 
 const W: usize = 96;
@@ -60,11 +60,9 @@ fn source() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 }
 
 fn aq_config(lf_level: u8) -> AdaptiveQuantConfig {
-    AdaptiveQuantConfig {
-        base_y_ac_qi: 40,
-        loop_filter_level: lf_level,
-        ..AdaptiveQuantConfig::default()
-    }
+    AdaptiveQuantConfig::default()
+        .with_base_y_ac_qi(40)
+        .with_loop_filter_level(lf_level)
 }
 
 const DELTAS: [i8; 4] = [16, 6, -6, -16];

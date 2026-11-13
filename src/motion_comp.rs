@@ -147,6 +147,7 @@ pub struct ReferencePlanes<'a> {
 
 /// Errors surfaced by the motion-compensation layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MotionCompError {
     /// The §18.1-adjusted motion vector has a non-zero fractional part,
     /// so §18.3 sub-pixel interpolation is required. Returned only by the
@@ -577,9 +578,9 @@ fn sixtap_2d_scalar(halo: &[u8; 81], mx: usize, my: usize, filters: &[[i32; 6]; 
 #[cfg(feature = "simd")]
 #[inline]
 fn sixtap_2d_simd(halo: &[u8; 81], mx: usize, my: usize, filters: &[[i32; 6]; 8]) -> [u8; 16] {
+    use core::simd::Simd;
     use core::simd::cmp::SimdOrd;
     use core::simd::num::{SimdInt, SimdUint};
-    use core::simd::Simd;
 
     let zero = Simd::<i32, 4>::splat(0);
     let max = Simd::<i32, 4>::splat(255);
@@ -804,7 +805,7 @@ fn sixtap_identity_elide<const HW: usize, const OW: usize, const HN: usize, cons
         // every sample equals the [`interp`] value.
         let [f0, f1, f2, f3, f4, f5] = filters[my];
         let mut hi = [[0i32; HW]; HW];
-        for (row, src) in hi.iter_mut().zip(halo.chunks_exact(HW)) {
+        for (row, src) in hi.iter_mut().zip(halo.as_chunks::<HW>().0) {
             for (dst, &s) in row.iter_mut().zip(src) {
                 *dst = s as i32;
             }
@@ -937,9 +938,9 @@ fn sixtap_mb_luma_simd(
     my: usize,
     filters: &[[i32; 6]; 8],
 ) -> [u8; 256] {
+    use core::simd::Simd;
     use core::simd::cmp::SimdOrd;
     use core::simd::num::{SimdInt, SimdUint};
-    use core::simd::Simd;
 
     let zero = Simd::<i32, 16>::splat(0);
     let max = Simd::<i32, 16>::splat(255);
@@ -1229,9 +1230,9 @@ fn sixtap_mb_chroma_simd(
     my: usize,
     filters: &[[i32; 6]; 8],
 ) -> [u8; 64] {
+    use core::simd::Simd;
     use core::simd::cmp::SimdOrd;
     use core::simd::num::{SimdInt, SimdUint};
-    use core::simd::Simd;
 
     let zero = Simd::<i32, 8>::splat(0);
     let max = Simd::<i32, 8>::splat(255);
@@ -2412,7 +2413,7 @@ mod tests {
         // Negative rounding: -((-s + 4) >> 3) — symmetric to positive.
         assert_eq!(avg(-8, -8, -8, -8), -((32 + 4) >> 3)); // = -4
         assert_eq!(avg(-1, -1, -1, -1), -((4 + 4) >> 3)); // = -1
-                                                          // Mixed sign, sum exactly zero.
+        // Mixed sign, sum exactly zero.
         assert_eq!(avg(5, -5, 3, -3), 0);
     }
 

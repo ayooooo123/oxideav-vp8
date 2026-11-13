@@ -6,10 +6,95 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
-- The registry decoder implements `Decoder::output_video_dimensions` /
-  `output_pixel_format`: the §9.1 frame size of the frame `receive_frame`
-  last returned, `Yuv420P`. A key frame of a new size is reported when it
-  is returned.
+- The registry decoder implements `Decoder::output_video_dimensions`
+  (`output_pixel_format` is `Yuv420P`): the §9.1 visible size of the
+  picture `receive_frame` last returned. A key frame of a new size is
+  announced by a `Frame::StreamParams` event first; the size changes when
+  that picture itself is returned.
+
+## [0.2.9](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.8...v0.2.9) - 2026-11-10
+
+### Added
+
+- *(encoder)* key-frame effort levels, wavefront threading, registry encoder options
+
+### Other
+
+- *(benchmarks)* 2400x1600 instruction / cycle counts from the final build
+- *(encoder)* tokenise rows in the wavefront workers; coefficient flags instead of a flattened copy
+- *(encoder)* rank candidates with a guarded pre-summed token estimate; docs for the effort levels
+- *(loop-filter)* whole-run normal filter kernel; fuzz the key-frame effort / thread options
+- *(encoder)* class-specialised trellis step, tabled token-bit estimate, no throw-away per-MB token pass
+- API hygiene: non_exhaustive errors/options/records + builders
+
+### Added
+
+- **Key-frame encode effort levels.** `EncodeEffort` (`Fastest` / `Fast` / `Balanced` / `Thorough`, numeric levels 0..=3) trades output size for encode time. `Thorough` (the default) is the exhaustive rate-distortion search and keeps the historical bytes; the reduced levels compare candidate modes with a closed-form cost model (weighted rounding error + tabled §13.3 token bits along the real context chain, §11.3 sub-mode signalling priced against the neighbouring macroblocks' contexts) and quantise only the winners — `Fast` and `Fastest` also shortlist modes by squared prediction error, and `Fastest` drops the trellis. Every level is a conformant stream that decodes to exactly the encoder's reconstruction.
+- **Threaded key-frame encode.** The macroblock analysis runs as a macroblock-row wavefront on a caller-given thread budget (scoped `std::thread`s, no new dependency), each worker also tokenising its rows into recorded decisions that are arithmetic-coded in row order; serial stays the default and the bytes are identical at every budget.
+- `KeyframeEncodeOptions` (`effort`, `threads`, `auto_loop_filter`, `fitted_token_prob_updates`; `#[non_exhaustive]`, `with_*` builders) with `encode_keyframe_with_options` / `encode_keyframe_with_reconstruction_and_options`. `KeyframeEncodeOptions::default()` is byte-identical to `encode_keyframe`.
+- `effort` / `threads` fields (and `with_effort` / `with_threads`) on `Vp8EncoderConfig` and `AltrefStreamConfig`; they apply to the key frames those encoders emit.
+- Registry: the `vp8` codec entry now carries an **encoder factory** (`make_encoder_from_param_options`) with a declared option schema — `Vp8EncoderOptions` (`effort`, `threads`, `qindex`, `quality`, `loop_filter_level`, `auto_loop_filter`, `partitions`), also reachable typed through `make_encoder_with_options`. Both framework encoders take the thread budget from `set_execution_context` (an explicit `threads` option wins).
+- `benches/keyframe_encode_photo.rs` and `examples/keyframe_timing.rs` — the photo-content latency matrix (800×533 and 2400×1600, per effort level and thread budget); `tests/encoder_keyframe_effort.rs` (default-options byte identity, thread-budget invariance, encoder↔decoder lockstep and a black-box cross-decode at every level, size / PSNR envelope, registry options). Fuzz target `keyframe_effort_threads_lockstep` (threaded == serial, decoder == encoder reconstruction at every level, default options == `encode_keyframe`).
+- `Default` on `Vp8CodedHeader`, `MbLfAdjustments`, `QuantIndices`, `Vp8DecodedFrame` and the other newly `#[non_exhaustive]` records whose fields all have one; full-field `new` on `Vp8FrameHeader`, `EncodedStreamFrame`, `AltrefStreamPacket` and `I420Frame`; `with_<field>` setters on all of them and on `KeyframeParams` / `KeyframeCodingOptions`. Tests, benches and fuzz targets build records through them.
+
+### Changed
+
+- *(perf)* keyframe encode: the §13 trellis runs a level-class-specialised step against the per-frame rate tables (exact reciprocal-multiply level rounding, tabled extra-bit token paths, pairwise first-minimum reduction), the RD token-bit estimate reads a per-frame step-cost table, the chroma picker hands its winning blocks to the residual pass, and the frame driver no longer token-codes each macroblock into a throw-away buffer. Output is byte-identical; see the measured table in `BENCHMARKS.md` §Round 486. The §7.3 boolean encoder renormalises in one step per symbol (identical bytes, pinned against the one-bit listing loop), the §11 mode layer writes from precomputed tree paths, and interior macroblocks are fetched with row copies. The mode pickers rank candidates with a pre-summed token-bit estimate behind a tie guard and price only the winner with the reference estimate (the choice is the reference choice — `ranked_search_matches_reference_search`), and identical sub-block predictions share one evaluation. On the 800×533 photo bench the default encode goes 113 → 63 ms single-threaded (−35 % instructions, −41 % cycles) at identical bytes.
+- *(perf)* §15.3 normal loop filter (stable builds): each 16- / 8-pixel edge run goes through one branch-free whole-run kernel over fixed-size tap arrays instead of a gather / filter / scatter per pixel position — bit-identical to the per-window listing kernels (pinned on random and extreme windows across the parameter range). Key-frame decode with the filter on is ~25 % faster (800×533: 7.0 → 5.2 ms; 2400×1600: 41 → 34 ms), an inter clip ~26 %; the encoder's own filter pass and RD level selector share the gain.
+- API hygiene: the error enums `BoolDecoderError`, `CodedHeaderError`, `DctTokenError`, `MbCoeffError`, `DecodeError`, `EncodeError`, `TokenEncodeError`, `FrameError`, `FrameHeaderError`, `Error`, `MacroblockError`, `MotionCompError`, `InterMbError`, `ReconstructError` and `StreamEncodeError`, the option / output enums `LoopFilterMode` and `AltrefPacketKind`, and the records `ArnrConfig`, `ArnrPicture`, `Vp8CodedHeader`, `SilentKeyframeParams`, `AdaptiveQuantConfig`, `InterCodingOptions`, `InterSegmentationConfig`, `FrameComplexity`, `Vp8EncoderStats`, `Vp8EncoderConfig`, `Vp8TwoPassConfig`, `Vp8FrameHeader`, `FrameFilterConfig`, `EncodedStreamFrame`, `AltrefStreamConfig` and `AltrefStreamPacket` are now `#[non_exhaustive]`. RFC 6386 syntax enums (tokens, block types, prediction modes, MV partitions, frame type, scale codes, filter selections) and the fixed bitstream records stay exhaustive. `Vp8Error`, `Vp8DecodedFrame`, `I420Frame`, `KeyframeParams` and `KeyframeCodingOptions` stay exhaustive for now because sibling crates still build or match them.
+
+## [0.2.8](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.7...v0.2.8) - 2026-11-06
+
+### Added
+
+- *(decoder)* output_params / generation / Frame::StreamParams contract
+
+### Other
+
+- output_params answers from an already-decoded (invisible) leading key frame
+- edition 2024, MSRV 1.95
+- README examples use the current registry API
+
+### Added
+
+- **Stream-parameter contract on the framework `Vp8Decoder`.**
+  `output_params()` answers the §9.1 visible width / height, `Yuv420P`
+  and the §9.2 `color_space` as the colour-signal matrix (0 → BT.601;
+  range / primaries / transfer unspecified — §9.2 states none), from the
+  already-decoded key frame, else the first queued one, before the first picture.
+  `output_params_generation()` bumps once per mid-stream change, and
+  `receive_frame` returns one `Frame::StreamParams` event (payload ==
+  `output_params()`) immediately before the first **shown** picture of
+  a new size — none for the first shape, a same-size key frame, or an
+  invisible key frame. `reset()` compares against the last picture
+  returned; the flush drain keeps old pictures → event → new pictures.
+- `Vp8Decoder::upscale()` / `clamping_type()` and
+  `Vp8DecoderState::upscale()` / `color_space()` / `clamping_type()` /
+  `max_pixels_per_frame()` expose the key-frame §9.1 / §9.2 fields.
+- Both framework encoders accept a size-changing `Frame::StreamParams`
+  event: the keyframe adapter encodes the next picture at the new size,
+  the lagged adapter closes its pending lookahead group and restarts
+  with a key frame. Non-`Yuv420P`, non-video or out-of-range events are
+  `Error::Unsupported`.
+- `tests/stream_params_event.rs` (14 tests) and
+  `tests/blackbox_resolution_switch.rs` (3 black-box `ffmpeg` splices,
+  byte-identical to the validator's per-segment decode, exactly one
+  change per switch).
+
+### Changed
+
+- edition 2024, MSRV 1.95
+- The framework `Vp8Decoder` no longer returns §9.1 `show_frame = 0`
+  pictures (they are decoded for their reference-slot effects, then
+  skipped; `receive_frame` moves on to the next queued packet or
+  answers `NeedMore`). Callers that counted one picture per packet on
+  auto-altref streams now see only the shown ones, matching the
+  validator's frame count.
+
+### Fixed
+
+- `Vp8Decoder::reset()` dropped the `DecoderLimits::max_pixels_per_frame`
+  cap set at construction; it now survives the reset.
 
 ## [0.2.7](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.6...v0.2.7) - 2026-08-24
 

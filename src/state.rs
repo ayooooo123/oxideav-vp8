@@ -38,24 +38,24 @@
 
 use crate::bool_decoder::BoolDecoder;
 use crate::coded_header::Vp8CodedHeader;
-use crate::dct_tokens::{merge_default_token_probs, CoeffProbs, MbEntropyCtx};
+use crate::dct_tokens::{CoeffProbs, MbEntropyCtx, merge_default_token_probs};
 use crate::decoder::{DecodeError, Vp8DecodedFrame};
-use crate::dequant::{decode_and_dequantize_mb, MbDequantFactors};
-use crate::frame::{decode_keyframe, FrameError, KeyframePlanes, MbCoeffs};
-use crate::frame_header::Vp8FrameHeader;
-use crate::loop_filter::{filter_frame, FrameFilterConfig, MAX_MB_SEGMENTS};
+use crate::dequant::{MbDequantFactors, decode_and_dequantize_mb};
+use crate::frame::{FrameError, KeyframePlanes, MbCoeffs, decode_keyframe};
+use crate::frame_header::{ScaleCode, Vp8FrameHeader};
+use crate::loop_filter::{FrameFilterConfig, MAX_MB_SEGMENTS, filter_frame};
 use crate::macroblock::{
-    parse_inter_frame_intra_macroblock_modes, parse_key_frame_macroblock_modes,
-    InterFrameIntraProbs, IntraYMode, MacroblockModes,
+    InterFrameIntraProbs, IntraYMode, MacroblockModes, parse_inter_frame_intra_macroblock_modes,
+    parse_key_frame_macroblock_modes,
 };
 use crate::motion_comp::{
-    filter_set_for_version, reconstruct_inter_mb, reconstruct_split_mv_mb, select_ref_frame,
-    RefFrame, ReferencePlanes,
+    RefFrame, ReferencePlanes, filter_set_for_version, reconstruct_inter_mb,
+    reconstruct_split_mv_mb, select_ref_frame,
 };
-use crate::motion_vector::{default_mv_contexts, resolve_mv_contexts, Mv, MvContexts};
+use crate::motion_vector::{Mv, MvContexts, default_mv_contexts, resolve_mv_contexts};
 use crate::near_mv::{
-    clamp_mv, decode_split_mv, find_near_mvs, mv_ref_probs, read_inter_mode, InterMbError,
-    InterMode, MbInfo, MvClampRect, ResolvedInterMode, SignBias, SplitMvResult,
+    InterMbError, InterMode, MbInfo, MvClampRect, ResolvedInterMode, SignBias, SplitMvResult,
+    clamp_mv, decode_split_mv, find_near_mvs, mv_ref_probs, read_inter_mode,
 };
 use crate::reconstruct::ReconstructedMb;
 
@@ -361,6 +361,17 @@ pub struct Vp8DecoderState {
     /// picture to the presentation sequence. `None` before any frame
     /// has been decoded successfully.
     last_frame_shown: Option<bool>,
+    /// §9.1 `(horizontal_scale, vertical_scale)` upscale codes of the most
+    /// recent key frame. `None` before any key frame has been decoded.
+    upscale: Option<(ScaleCode, ScaleCode)>,
+    /// §9.2 `color_space` bit of the most recent key frame (`false` = the
+    /// BT.601-like YUV colour space, `true` = reserved). `None` before any
+    /// key frame has been decoded.
+    color_space: Option<bool>,
+    /// §9.2 `clamping_type` bit of the most recent key frame (`false` =
+    /// the decoder must clamp, `true` = the encoder guarantees in-range
+    /// pixels). `None` before any key frame has been decoded.
+    clamping_type: Option<bool>,
     /// DoS guard: the §9.1 declared `width × height` a key frame may
     /// carry before decode refuses it with
     /// [`DecodeError::FrameTooLarge`](crate::decoder::DecodeError::FrameTooLarge).
@@ -398,6 +409,9 @@ impl Vp8DecoderState {
             visible_width: None,
             visible_height: None,
             last_frame_shown: None,
+            upscale: None,
+            color_space: None,
+            clamping_type: None,
             max_pixels_per_frame: crate::decoder::DEFAULT_MAX_PIXELS_PER_FRAME,
         }
     }
@@ -587,6 +601,12 @@ impl Vp8DecoderState {
         self.sign_bias = SignBias::default();
         self.visible_width = Some(width);
         self.visible_height = Some(height);
+        self.upscale = Some((
+            header.horizontal_scale.unwrap_or(ScaleCode::None),
+            header.vertical_scale.unwrap_or(ScaleCode::None),
+        ));
+        self.color_space = Some(coded.color_space.unwrap_or(false));
+        self.clamping_type = Some(coded.clamping_type.unwrap_or(false));
 
         Ok(output)
     }
@@ -1142,6 +1162,40 @@ impl Vp8DecoderState {
     pub fn visible_height(&self) -> Option<u32> {
         self.visible_height
     }
+
+    /// §9.1 `(horizontal_scale, vertical_scale)` upscale codes carried
+    /// from the most recent key frame, if any.
+    ///
+    /// §9.1: "Upscaling does not affect the reconstruction buffer" — the
+    /// decoded planes stay at [`visible_width`](Self::visible_width) ×
+    /// [`visible_height`](Self::visible_height); the codes are a display
+    /// hint the presentation layer may apply with any reasonable
+    /// upsampler.
+    pub fn upscale(&self) -> Option<(ScaleCode, ScaleCode)> {
+        self.upscale
+    }
+
+    /// §9.2 `color_space` bit carried from the most recent key frame:
+    /// `Some(false)` = "YUV color space similar to the YCrCb color space
+    /// defined in [ITU-R_BT.601]", `Some(true)` = reserved. `None` before
+    /// any key frame has been decoded.
+    pub fn color_space(&self) -> Option<bool> {
+        self.color_space
+    }
+
+    /// §9.2 `clamping_type` bit carried from the most recent key frame:
+    /// `Some(false)` = the decoder is required to clamp reconstructed
+    /// pixels to `0..=255`, `Some(true)` = the encoder guarantees they
+    /// already are. `None` before any key frame has been decoded.
+    pub fn clamping_type(&self) -> Option<bool> {
+        self.clamping_type
+    }
+
+    /// The §9.1 DoS cap this state enforces on key-frame dimensions
+    /// (see [`with_max_pixels_per_frame`](Self::with_max_pixels_per_frame)).
+    pub fn max_pixels_per_frame(&self) -> u64 {
+        self.max_pixels_per_frame
+    }
 }
 
 /// Helper: parse a 2-bit segment-id literal against the §10
@@ -1168,16 +1222,16 @@ fn read_segment_id(
 fn resolve_segment_dequant_factors(coded: &Vp8CodedHeader) -> [MbDequantFactors; MAX_MB_SEGMENTS] {
     let base = MbDequantFactors::from_quant_indices(&coded.quant_indices);
     let mut out = [base; MAX_MB_SEGMENTS];
-    if coded.segmentation_enabled {
-        if let Some(seg) = coded.update_segmentation {
-            for (i, slot) in out.iter_mut().enumerate() {
-                let qval = seg.quantizer_update[i].unwrap_or(0) as i32;
-                *slot = MbDequantFactors::for_segment(
-                    &coded.quant_indices,
-                    qval,
-                    seg.segment_feature_mode_absolute,
-                );
-            }
+    if coded.segmentation_enabled
+        && let Some(seg) = coded.update_segmentation
+    {
+        for (i, slot) in out.iter_mut().enumerate() {
+            let qval = seg.quantizer_update[i].unwrap_or(0) as i32;
+            *slot = MbDequantFactors::for_segment(
+                &coded.quant_indices,
+                qval,
+                seg.segment_feature_mode_absolute,
+            );
         }
     }
     out

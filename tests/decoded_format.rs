@@ -1,8 +1,9 @@
 //! The registry decoder reports the size of the frame it last returned
 //! (oxideav-core `Decoder::output_video_dimensions` /
-//! `output_pixel_format`): an odd size, then a new size at a key frame.
-//! Frames are decoded in `receive_frame`, so a queued key frame changes
-//! nothing until it is returned.
+//! `output_pixel_format`): an odd size, then a new size at a key frame,
+//! whose picture arrives behind the `Frame::StreamParams` event that
+//! announces it. Frames are decoded in `receive_frame`, so a queued key
+//! frame changes nothing until it is returned.
 //!
 //! `decoded_format/*.ivf` are three-frame libvpx encodes of FFmpeg
 //! `testsrc`.
@@ -45,6 +46,24 @@ fn each_frame_reports_its_own_size() {
                 dec.output_video_dimensions(),
                 last,
                 "frame {at}: before it is returned"
+            );
+        }
+        if let Some(previous) = last.filter(|&size| size != (w, h)) {
+            // A picture of a new size sits behind one `StreamParams` event
+            // announcing it; the reported size still describes the last
+            // picture returned, not the announced one.
+            match dec.receive_frame() {
+                Ok(Frame::StreamParams(p)) => assert_eq!(
+                    (p.width, p.height),
+                    (Some(w), Some(h)),
+                    "frame {at}: announced size"
+                ),
+                other => panic!("frame {at}: expected the size-change event, got {other:?}"),
+            }
+            assert_eq!(
+                dec.output_video_dimensions(),
+                Some(previous),
+                "frame {at}: announced, not yet returned"
             );
         }
         let frame = match dec.receive_frame() {

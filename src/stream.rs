@@ -63,6 +63,7 @@
 
 use crate::coded_header::TokenProbUpdates;
 use crate::encoder::{
+    EncodeError, I420Frame, KeyframeParams, LoopFilterDeltas, RefreshControls,
     encode_keyframe_with_reconstruction,
     encode_keyframe_with_reconstruction_and_fitted_token_prob_updates, encode_p_frame_multi_ref,
     encode_p_frame_multi_ref_with_fitted_token_prob_updates,
@@ -70,7 +71,6 @@ use crate::encoder::{
     encode_p_frame_multi_ref_with_refresh_and_intra_pick,
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates,
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates,
-    EncodeError, I420Frame, KeyframeParams, LoopFilterDeltas, RefreshControls,
 };
 use crate::frame::KeyframePlanes;
 use crate::state::RefFrameSlot;
@@ -83,6 +83,7 @@ use crate::state::RefFrameSlot;
 /// for *another* key frame but which most container clients treat as
 /// a stream split — we reject it here to keep the contract explicit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamEncodeError {
     /// A frame after the first was supplied with different dimensions
     /// than the first. The driver treats the dimensions as locked at
@@ -381,6 +382,7 @@ pub enum FrameKind {
 /// the bytes into a container while logging or asserting the
 /// scheduling pattern.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EncodedStreamFrame {
     /// Raw VP8 elementary-stream bytes for this frame (one packet =
     /// one frame). Suitable for IVF muxing or for
@@ -392,6 +394,38 @@ pub struct EncodedStreamFrame {
     /// 0-based frame index inside this stream — equal to the encoder's
     /// `frame_count()` at the moment this frame was emitted minus one.
     pub frame_index: u64,
+}
+
+impl EncodedStreamFrame {
+    /// Build a `EncodedStreamFrame` from every field.
+    pub fn new(bytes: Vec<u8>, kind: FrameKind, frame_index: u64) -> Self {
+        Self {
+            bytes,
+            kind,
+            frame_index,
+        }
+    }
+
+    /// Set `bytes`.
+    #[must_use]
+    pub fn with_bytes(mut self, v: Vec<u8>) -> Self {
+        self.bytes = v;
+        self
+    }
+
+    /// Set `kind`.
+    #[must_use]
+    pub fn with_kind(mut self, v: FrameKind) -> Self {
+        self.kind = v;
+        self
+    }
+
+    /// Set `frame_index`.
+    #[must_use]
+    pub fn with_frame_index(mut self, v: u64) -> Self {
+        self.frame_index = v;
+        self
+    }
 }
 
 impl EncodedStreamFrame {
@@ -590,7 +624,7 @@ impl Vp8InterStreamEncoder {
         }
         // This call would emit P-frame number `p_frames_since_keyframe
         // + 1` since the last key frame.
-        (self.p_frames_since_keyframe + 1) % self.golden_interval == 0
+        (self.p_frames_since_keyframe + 1).is_multiple_of(self.golden_interval)
     }
 
     /// Decide whether the next [`Self::encode_frame`] call would emit
@@ -687,7 +721,7 @@ impl Vp8InterStreamEncoder {
         // the key frame) is a multiple of the interval.
         let refresh_golden = !emit_key
             && self.golden_interval != 0
-            && (self.p_frames_since_keyframe + 1) % self.golden_interval == 0;
+            && (self.p_frames_since_keyframe + 1).is_multiple_of(self.golden_interval);
 
         let (bytes, planes, kind) = if emit_key {
             let (b, p) = encode_keyframe_with_reconstruction(frame, &self.params)?;
@@ -2073,6 +2107,7 @@ fn ref_slot_to_keyframe_planes(slot: &RefFrameSlot) -> KeyframePlanes {
 
 /// Configuration for [`Vp8AltrefStreamEncoder`].
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct AltrefStreamConfig {
     /// Per-frame encode parameters (§9.6 quantiser, §9.4 loop filter,
     /// §13 trellis strength, …) applied to every emitted frame.
@@ -2144,6 +2179,100 @@ pub struct AltrefStreamConfig {
     /// keep the frame-wide quantiser (the keyframe AQ path is a
     /// separate front door). Default `None`.
     pub segmentation: Option<crate::encoder::InterSegmentationConfig>,
+    /// Mode-search effort of the stream's **key frames** (see
+    /// [`EncodeEffort`](crate::encoder::EncodeEffort)). The inter frames
+    /// run their own search and do not consult it. Default
+    /// `Thorough` (the historical bytes).
+    pub effort: crate::encoder::EncodeEffort,
+    /// Thread budget for each key frame's macroblock-row wavefront
+    /// (`0` / `1` = serial, the default). Does not change the bytes.
+    pub threads: usize,
+}
+
+impl AltrefStreamConfig {
+    /// Set `effort`.
+    #[must_use]
+    pub fn with_effort(mut self, v: crate::encoder::EncodeEffort) -> Self {
+        self.effort = v;
+        self
+    }
+
+    /// Set `threads`.
+    #[must_use]
+    pub fn with_threads(mut self, v: usize) -> Self {
+        self.threads = v;
+        self
+    }
+
+    /// Set `params`.
+    #[must_use]
+    pub fn with_params(mut self, v: KeyframeParams) -> Self {
+        self.params = v;
+        self
+    }
+
+    /// Set `keyframe_interval`.
+    #[must_use]
+    pub fn with_keyframe_interval(mut self, v: u64) -> Self {
+        self.keyframe_interval = v;
+        self
+    }
+
+    /// Set `altref_window`.
+    #[must_use]
+    pub fn with_altref_window(mut self, v: usize) -> Self {
+        self.altref_window = v;
+        self
+    }
+
+    /// Set `arnr`.
+    #[must_use]
+    pub fn with_arnr(mut self, v: crate::arnr::ArnrConfig) -> Self {
+        self.arnr = v;
+        self
+    }
+
+    /// Set `golden_promotion`.
+    #[must_use]
+    pub fn with_golden_promotion(mut self, v: bool) -> Self {
+        self.golden_promotion = v;
+        self
+    }
+
+    /// Set `scene_cut_mad_threshold`.
+    #[must_use]
+    pub fn with_scene_cut_mad_threshold(mut self, v: f64) -> Self {
+        self.scene_cut_mad_threshold = v;
+        self
+    }
+
+    /// Set `auto_loop_filter`.
+    #[must_use]
+    pub fn with_auto_loop_filter(mut self, v: bool) -> Self {
+        self.auto_loop_filter = v;
+        self
+    }
+
+    /// Set `fitted_token_prob_updates`.
+    #[must_use]
+    pub fn with_fitted_token_prob_updates(mut self, v: bool) -> Self {
+        self.fitted_token_prob_updates = v;
+        self
+    }
+
+    /// Set `intra_pick`.
+    #[must_use]
+    pub fn with_intra_pick(mut self, v: bool) -> Self {
+        self.intra_pick = v;
+        self
+    }
+
+    /// Set `segmentation`.
+    #[must_use]
+    pub fn with_segmentation(mut self, v: Option<crate::encoder::InterSegmentationConfig>) -> Self {
+        self.segmentation = v;
+        self
+    }
 }
 
 impl Default for AltrefStreamConfig {
@@ -2161,12 +2290,15 @@ impl Default for AltrefStreamConfig {
             fitted_token_prob_updates: false,
             intra_pick: false,
             segmentation: None,
+            effort: crate::encoder::EncodeEffort::Thorough,
+            threads: 1,
         }
     }
 }
 
 /// Classification of one packet emitted by [`Vp8AltrefStreamEncoder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AltrefPacketKind {
     /// §9.1 key frame (visible; refreshes all three slots).
     Key,
@@ -2184,6 +2316,7 @@ pub enum AltrefPacketKind {
 /// lookahead group); `source_index` ties visible packets back to their
 /// source frame.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AltrefStreamPacket {
     /// Raw VP8 elementary-stream bytes (one packet = one frame; feed to
     /// [`crate::state::Vp8DecoderState::decode_frame`] in emission
@@ -2194,6 +2327,38 @@ pub struct AltrefStreamPacket {
     /// 0-based index of the source frame this packet displays, or
     /// `None` for an invisible anchor (which displays nothing).
     pub source_index: Option<u64>,
+}
+
+impl AltrefStreamPacket {
+    /// Build a `AltrefStreamPacket` from every field.
+    pub fn new(bytes: Vec<u8>, kind: AltrefPacketKind, source_index: Option<u64>) -> Self {
+        Self {
+            bytes,
+            kind,
+            source_index,
+        }
+    }
+
+    /// Set `bytes`.
+    #[must_use]
+    pub fn with_bytes(mut self, v: Vec<u8>) -> Self {
+        self.bytes = v;
+        self
+    }
+
+    /// Set `kind`.
+    #[must_use]
+    pub fn with_kind(mut self, v: AltrefPacketKind) -> Self {
+        self.kind = v;
+        self
+    }
+
+    /// Set `source_index`.
+    #[must_use]
+    pub fn with_source_index(mut self, v: Option<u64>) -> Self {
+        self.source_index = v;
+        self
+    }
 }
 
 impl AltrefStreamPacket {
@@ -2333,6 +2498,13 @@ impl Vp8AltrefStreamEncoder {
         })
     }
 
+    /// Change the key-frame thread budget of a running stream (the
+    /// bytes do not depend on it).
+    #[cfg_attr(not(feature = "registry"), allow(dead_code))]
+    pub(crate) fn set_threads(&mut self, threads: usize) {
+        self.config.threads = threads;
+    }
+
     /// The configuration this stream was built with.
     pub fn config(&self) -> &AltrefStreamConfig {
         &self.config
@@ -2352,7 +2524,8 @@ impl Vp8AltrefStreamEncoder {
     /// Whether source frame `index` is scheduled as a key frame.
     fn is_key_index(&self, index: u64) -> bool {
         index == 0
-            || (self.config.keyframe_interval > 0 && index % self.config.keyframe_interval == 0)
+            || (self.config.keyframe_interval > 0
+                && index.is_multiple_of(self.config.keyframe_interval))
     }
 
     /// Feed one source frame; returns every packet the stream can emit
@@ -2448,12 +2621,15 @@ impl Vp8AltrefStreamEncoder {
         // Key frame: scheduled, scene-cut-forced, or forced because
         // the stream has no reference yet.
         if self.is_key_index(start) || forced_key || self.last.is_none() {
-            let (bytes, recon) =
-                crate::encoder::encode_keyframe_with_reconstruction_and_coding_options(
-                    &group[0].as_i420(),
-                    &self.config.params,
-                    &kf_options,
-                )?;
+            let (bytes, recon) = crate::encoder::encode_keyframe_with_reconstruction_and_options(
+                &group[0].as_i420(),
+                &self.config.params,
+                &crate::encoder::KeyframeEncodeOptions::new()
+                    .with_effort(self.config.effort)
+                    .with_threads(self.config.threads)
+                    .with_auto_loop_filter(kf_options.auto_loop_filter)
+                    .with_fitted_token_prob_updates(kf_options.fitted_token_prob_updates),
+            )?;
             self.last = Some(recon.clone());
             self.golden = Some(recon.clone());
             self.altref = Some(recon);

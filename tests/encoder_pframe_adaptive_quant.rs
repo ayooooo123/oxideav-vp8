@@ -26,10 +26,10 @@ use std::io::Write as _;
 use std::process::{Command, Stdio};
 
 use oxideav_vp8::{
+    EncodeError, I420Frame, InterCodingOptions, InterSegmentationConfig, KeyframeParams,
+    KeyframePlanes, RefreshControls, Vp8CodedHeader, Vp8DecoderState, Vp8FrameHeader,
     encode_keyframe_with_reconstruction, encode_p_frame_multi_ref_adaptive_quant,
-    encode_p_frame_multi_ref_with_refresh, EncodeError, I420Frame, InterCodingOptions,
-    InterSegmentationConfig, KeyframeParams, KeyframePlanes, RefreshControls, Vp8CodedHeader,
-    Vp8DecoderState, Vp8FrameHeader,
+    encode_p_frame_multi_ref_with_refresh,
 };
 
 const W: usize = 96;
@@ -49,7 +49,7 @@ fn source(dx: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
                 (80 + (cc / 2) % 100) as u8
             } else {
                 let t = ((r * 13 + cc * 7) % 61) as i32 * 3 - 90;
-                let e = if (cc / 4) % 2 == 0 { 50 } else { -50 };
+                let e = if (cc / 4).is_multiple_of(2) { 50 } else { -50 };
                 (128 + t / 2 + e).clamp(0, 255) as u8
             };
             y[r * W + c] = v;
@@ -77,11 +77,9 @@ fn keyed_reference() -> (Vec<u8>, KeyframePlanes) {
 }
 
 fn seg_config(lf: Option<[i8; 4]>) -> InterSegmentationConfig {
-    InterSegmentationConfig {
-        quant_delta: [10, 2, -4, -10],
-        lf_delta: lf,
-        ..InterSegmentationConfig::default()
-    }
+    InterSegmentationConfig::default()
+        .with_quant_delta([10, 2, -4, -10])
+        .with_lf_delta(lf)
 }
 
 /// Parse the coded header of an inter frame.
@@ -210,15 +208,11 @@ fn segmentation_composes_with_all_coding_options() {
     let (kf_bytes, kf) = keyed_reference();
     let (y, u, v) = source(3);
     let frame = I420Frame::packed(W as u32, H as u32, &y, &u, &v);
-    let options = InterCodingOptions {
-        intra_pick: true,
-        auto_loop_filter: true,
-        fitted_token_prob_updates: true,
-    };
-    let no_fit = InterCodingOptions {
-        fitted_token_prob_updates: false,
-        ..options
-    };
+    let options = InterCodingOptions::default()
+        .with_intra_pick(true)
+        .with_auto_loop_filter(true)
+        .with_fitted_token_prob_updates(true);
+    let no_fit = options.with_fitted_token_prob_updates(false);
 
     let (baseline, _) = encode_p_frame_multi_ref_adaptive_quant(
         &frame,

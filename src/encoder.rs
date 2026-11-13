@@ -65,6 +65,7 @@ use crate::frame_header::KEY_FRAME_START_CODE;
 
 /// Errors surfaced by the encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EncodeError {
     /// Visible width or height is zero or exceeds the 14-bit VP8 field
     /// (`width > 0x3FFF` or `height > 0x3FFF`).
@@ -280,35 +281,65 @@ impl BoolEncoder {
     /// Encode one boolean against the §7.3 probability split formula.
     /// `prob` is the (approximate) probability that `value` is `false`,
     /// expressed as `prob / 256`.
+    ///
+    /// The §7.3 listing renormalises one bit at a time: while
+    /// `range < 128` it doubles `range`, propagates a carry if bit 31 of
+    /// `bottom` is set, doubles `bottom`, and emits the top byte every
+    /// time `bit_count` reaches zero. This routine takes the whole
+    /// renormalisation in one step. The shift count is the number of
+    /// leading zeros of the 8-bit `range` (1..=7), and at most one byte
+    /// boundary falls inside it. Bit 31 can only be set at the doubling
+    /// that completes a byte: `bottom` is below `2^24` after a byte is
+    /// emitted (below `2^8` initially) and gains less than `2^8` between
+    /// doublings (the splits added while `range` stays ≥ 128 sum to less
+    /// than 128), so after `k` doublings it is below `(2^24 + 2^8)·2^k`,
+    /// which stays under `2^31` until the eighth. The carry test is
+    /// therefore needed exactly once, on the value shifted to just
+    /// before the boundary. `write_bool_matches_bitwise_listing` pins
+    /// the byte stream and the final state against the one-bit loop.
+    #[inline]
     pub fn write_bool(&mut self, prob: u8, value: bool) {
         // split = 1 + (((range - 1) * prob) >> 8) — the same formula as
         // §7.3's decoder so the value→bit split is exact.
         let split = 1 + (((self.range - 1) * prob as u32) >> 8);
-        if value {
-            self.bottom = self.bottom.wrapping_add(split);
-            self.range -= split;
+        let (mut range, mut bottom) = if value {
+            (self.range - split, self.bottom.wrapping_add(split))
         } else {
-            self.range = split;
-        }
-        while self.range < 128 {
-            self.range <<= 1;
-            // §7.3 `add_one_to_output`: propagate a carry into the
-            // already-written tail, scanning backwards through 0xFF
-            // bytes (which roll to 0 and force the next byte to
-            // receive the carry).
-            if (self.bottom >> 31) & 1 == 1 {
-                add_one_to_output(&mut self.out);
-            }
-            self.bottom <<= 1;
-            self.bit_count -= 1;
-            if self.bit_count == 0 {
-                // Emit the high byte of `bottom`, keep the low 24 bits.
-                let byte = (self.bottom >> 24) as u8;
-                self.out.push(byte);
-                self.bottom &= (1 << 24) - 1;
-                self.bit_count = 8;
+            (split, self.bottom)
+        };
+        if range < 128 {
+            let shift = range.leading_zeros() - 24;
+            range <<= shift;
+            let count = self.bit_count as u32;
+            if shift < count {
+                bottom <<= shift;
+                self.bit_count -= shift as i32;
+            } else {
+                bottom = self.emit_byte(bottom, shift, count);
             }
         }
+        self.range = range;
+        self.bottom = bottom;
+    }
+
+    /// The renormalisation step that crosses a byte boundary: shift up
+    /// to the doubling that brings `bit_count` to zero, run the carry
+    /// test (§7.3 `add_one_to_output`), emit the high byte, keep the low
+    /// 24 bits and apply the rest of the shift. Kept out of line so
+    /// [`write_bool`](Self::write_bool)'s common path stays small.
+    #[cold]
+    #[inline(never)]
+    fn emit_byte(&mut self, mut bottom: u32, shift: u32, count: u32) -> u32 {
+        bottom <<= count - 1;
+        if bottom >> 31 == 1 {
+            add_one_to_output(&mut self.out);
+        }
+        bottom <<= 1;
+        self.out.push((bottom >> 24) as u8);
+        bottom &= (1 << 24) - 1;
+        let rest = shift - count;
+        self.bit_count = 8 - rest as i32;
+        bottom << rest
     }
 
     /// Encode `num_bits` flag bits MSB-first at the flat probability of
@@ -398,6 +429,19 @@ impl BoolEncoder {
         for &bit in &path[..len] {
             self.write_bool(prob_lookup((i as usize) >> 1), bit);
             i = tree[i as usize + bit as usize];
+        }
+    }
+
+    /// [`write_treed`](Self::write_treed) from a precomputed path table:
+    /// the same `(probability index, bit)` steps in the same order,
+    /// without the per-symbol tree search.
+    fn write_treed_cached<F>(&mut self, paths: &[TreedLeafPath], prob_lookup: F, leaf: u8)
+    where
+        F: Fn(usize) -> u8,
+    {
+        let p = &paths[leaf as usize];
+        for s in 0..p.len as usize {
+            self.write_bool(prob_lookup(p.prob_index[s] as usize), p.bits[s]);
         }
     }
 
@@ -1103,6 +1147,7 @@ pub fn write_token_prob_updates(
 /// the §9.4 loop filter (default disabled via `loop_filter_level = 0`),
 /// and an optional override of the §9.6 `y_ac_qi` baseline (default 0).
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct SilentKeyframeParams {
     /// Visible width in pixels (1..=0x3FFF per §9.1).
     pub width: u32,
@@ -1121,6 +1166,50 @@ pub struct SilentKeyframeParams {
     pub y_ac_qi: u8,
     /// §9.5 DCT partition count. Must be one of 1 / 2 / 4 / 8.
     pub nbr_of_dct_partitions: u8,
+}
+
+impl SilentKeyframeParams {
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `loop_filter_level`.
+    #[must_use]
+    pub fn with_loop_filter_level(mut self, v: u8) -> Self {
+        self.loop_filter_level = v;
+        self
+    }
+
+    /// Set `sharpness_level`.
+    #[must_use]
+    pub fn with_sharpness_level(mut self, v: u8) -> Self {
+        self.sharpness_level = v;
+        self
+    }
+
+    /// Set `y_ac_qi`.
+    #[must_use]
+    pub fn with_y_ac_qi(mut self, v: u8) -> Self {
+        self.y_ac_qi = v;
+        self
+    }
+
+    /// Set `nbr_of_dct_partitions`.
+    #[must_use]
+    pub fn with_nbr_of_dct_partitions(mut self, v: u8) -> Self {
+        self.nbr_of_dct_partitions = v;
+        self
+    }
 }
 
 impl Default for SilentKeyframeParams {
@@ -1510,7 +1599,7 @@ const COEFF_UPDATE_PROBS: [[[[u8; 11]; 3]; 8]; 4] = [
 
 // ───────────────────────── Phase 2: §13 DCT-token encoder ─────────────────────
 
-use crate::dct_tokens::{BlockType, CoeffProbs, DctToken, COEFF_BANDS};
+use crate::dct_tokens::{BlockType, COEFF_BANDS, CoeffProbs, DctToken};
 
 /// §13.2 `coeff_tree` — duplicated here for the encoder's tree walk so
 /// the inverse mapping (`token -> bit path`) can be computed against
@@ -1583,6 +1672,7 @@ pub fn classify_coeff_token(abs_value: u16) -> DctToken {
 
 /// Errors surfaced by the §13 token-block encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TokenEncodeError {
     /// A coefficient magnitude exceeded the §13.2 alphabet's largest
     /// representable value (`67 + (2^11 - 1) = 2114`). The encoder
@@ -1787,26 +1877,87 @@ pub fn encode_coeff_block(
     left_has_nonzero: bool,
     coeffs: &[i16; 16],
 ) -> Result<usize, TokenEncodeError> {
+    encode_coeff_block_into(
+        enc,
+        block_type,
+        coeff_probs,
+        above_has_nonzero,
+        left_has_nonzero,
+        coeffs,
+    )
+}
+
+/// Where the §13 token walk sends its §7.3 boolean decisions: straight
+/// into a [`BoolEncoder`], or into a [`RecordedBools`] list that is
+/// replayed into one later (the threaded key-frame driver tokenises rows
+/// in its workers and leaves only the arithmetic coding in order).
+trait BoolSink {
+    /// One decision: `value` at probability-of-zero `prob / 256`.
+    fn put(&mut self, prob: u8, value: bool);
+}
+
+impl BoolSink for BoolEncoder {
+    #[inline]
+    fn put(&mut self, prob: u8, value: bool) {
+        self.write_bool(prob, value);
+    }
+}
+
+/// Recorded §7.3 decisions in coding order — the probability in the low
+/// byte, the bit in bit 8.
+type RecordedBools = Vec<u16>;
+
+impl BoolSink for RecordedBools {
+    #[inline]
+    fn put(&mut self, prob: u8, value: bool) {
+        self.push(prob as u16 | (value as u16) << 8);
+    }
+}
+
+impl BoolEncoder {
+    /// Code a recorded decision list — the same `write_bool` calls, in
+    /// order, the recording walk would have made directly.
+    fn write_recorded(&mut self, decisions: &[u16]) {
+        for &d in decisions {
+            self.write_bool(d as u8, d >> 8 != 0);
+        }
+    }
+}
+
+/// [`encode_coeff_block`] into any [`BoolSink`].
+fn encode_coeff_block_into<S: BoolSink>(
+    enc: &mut S,
+    block_type: BlockType,
+    coeff_probs: &CoeffProbs,
+    above_has_nonzero: bool,
+    left_has_nonzero: bool,
+    coeffs: &[i16; 16],
+) -> Result<usize, TokenEncodeError> {
     let plane = block_type.plane_index();
     let first_coeff = block_type.first_coeff();
 
-    // Validate range up front — §13.2 Cat6 maxes out at 67 + 2047 = 2114.
-    for (i, &v) in coeffs.iter().enumerate().skip(first_coeff) {
-        let abs = v.unsigned_abs();
-        if abs > 2114 {
-            return Err(TokenEncodeError::CoefficientOutOfRange { index: i, value: v });
-        }
-    }
-
-    // Find the last non-zero coefficient so the encoder knows where
-    // (if anywhere) to emit the explicit EOB token. If the entire
-    // block is zero the EOB lands at `first_coeff` immediately.
+    // One pass over the coded positions: the largest magnitude (for the
+    // §13.2 range check — Cat6 maxes out at 67 + 2047 = 2114) and the
+    // last non-zero coefficient, which tells the encoder where (if
+    // anywhere) to emit the explicit EOB token. If the entire block is
+    // zero the EOB lands at `first_coeff` immediately.
     let mut last_non_zero: i32 = -1;
-    for (i, &v) in coeffs.iter().enumerate() {
-        if i >= first_coeff && v != 0 {
+    let mut max_abs = 0u16;
+    for (i, &v) in coeffs.iter().enumerate().skip(first_coeff) {
+        max_abs = max_abs.max(v.unsigned_abs());
+        if v != 0 {
             last_non_zero = i as i32;
         }
     }
+    if max_abs > 2114 {
+        // Report the first offender.
+        for (i, &v) in coeffs.iter().enumerate().skip(first_coeff) {
+            if v.unsigned_abs() > 2114 {
+                return Err(TokenEncodeError::CoefficientOutOfRange { index: i, value: v });
+            }
+        }
+    }
+    let token_paths = &*TOKEN_BIT_PATHS;
 
     let mut ctx3: usize = (above_has_nonzero as usize) + (left_has_nonzero as usize);
     let mut prev_was_zero = false;
@@ -1831,10 +1982,10 @@ pub fn encode_coeff_block(
         // internal node 1 (raw index 2) when the previous coefficient
         // was a literal `DCT_0` — the decoder will not have read the
         // EOB-vs-rest split bit, so neither must we write it.
-        let start = if prev_was_zero { 2i8 } else { 0i8 };
-
-        for step in token_to_bit_path(token, start) {
-            enc.write_bool(probs[step.prob_index as usize], step.bit);
+        let (path, path_len) = &token_paths[prev_was_zero as usize][token as usize];
+        debug_assert!(*path_len > 0, "EOB cannot follow a literal DCT_0");
+        for step in &path[..*path_len as usize] {
+            enc.put(probs[step.prob_index as usize], step.bit);
         }
 
         if token == DctToken::Eob {
@@ -1850,12 +2001,12 @@ pub fn encode_coeff_block(
             let n = plist.len();
             for (j, &p) in plist.iter().enumerate() {
                 let bit = ((extra >> (n - 1 - j)) & 1) == 1;
-                enc.write_bool(p, bit);
+                enc.put(p, bit);
             }
         }
 
         if abs_value != 0 {
-            enc.write_bool(128, sign);
+            enc.put(128, sign);
             non_zero_count += 1;
         }
 
@@ -1944,14 +2095,19 @@ use crate::dct_tokens::MbEntropyCtx;
 use crate::forward_transform::{forward_dct_4x4, forward_wht_4x4, raster_to_scan};
 use crate::frame::MbCoeffs;
 use crate::intra_predict::{
-    predict_b4x4, predict_uv8x8, predict_y16x16, DEFAULT_ABOVE_PIXEL, DEFAULT_LEFT_PIXEL,
+    DEFAULT_ABOVE_PIXEL, DEFAULT_LEFT_PIXEL, predict_b4x4, predict_uv8x8, predict_y16x16,
 };
 use crate::inverse_transform::{add_residue_4x4, inverse_dct_4x4, inverse_wht_4x4};
 use crate::macroblock::{
-    IntraBmode, IntraUvMode, IntraYMode, MacroblockModes, BMODE_TREE, IF_UV_MODE_PROB_DEFAULTS,
-    IF_YMODE_PROB_DEFAULTS, IF_YMODE_TREE, KF_BMODE_PROB, KF_UV_MODE_PROB, KF_YMODE_PROB,
-    KF_YMODE_TREE, UV_MODE_TREE,
+    BMODE_TREE, IF_UV_MODE_PROB_DEFAULTS, IF_YMODE_PROB_DEFAULTS, IF_YMODE_TREE, IntraBmode,
+    IntraUvMode, IntraYMode, KF_BMODE_PROB, KF_UV_MODE_PROB, KF_YMODE_PROB, KF_YMODE_TREE,
+    MacroblockModes, UV_MODE_TREE,
 };
+
+mod effort;
+mod wavefront;
+
+pub use effort::{EncodeEffort, KeyframeEncodeOptions};
 
 /// Round-half-away-from-zero integer division — the natural inverse of
 /// the §14.1 `q * factor` dequant multiply. Used by the encoder to
@@ -2007,12 +2163,20 @@ pub struct MbPixels {
 #[inline]
 fn block_ssd(recon: &[u8], src: &[u8]) -> u64 {
     debug_assert_eq!(recon.len(), src.len());
+    // A term is at most 255² and a block at most 256 pixels, so a `u32`
+    // accumulator cannot overflow (4096-pixel chunks keep that true for
+    // longer slices) and the loop vectorises.
     recon
-        .iter()
-        .zip(src.iter())
-        .map(|(&r, &s)| {
-            let d = r as i64 - s as i64;
-            (d * d) as u64
+        .chunks(4096)
+        .zip(src.chunks(4096))
+        .map(|(r, s)| {
+            r.iter()
+                .zip(s)
+                .map(|(&a, &b)| {
+                    let d = a as i32 - b as i32;
+                    (d * d) as u32
+                })
+                .sum::<u32>() as u64
         })
         .sum()
 }
@@ -2205,6 +2369,19 @@ static UV_MODE_PATHS: std::sync::LazyLock<[TreedLeafPath; 4]> =
 /// Precomputed paths for the §11.2 / §11.4 4×4 sub-block mode tree.
 static BMODE_PATHS: std::sync::LazyLock<[TreedLeafPath; 10]> =
     std::sync::LazyLock::new(|| precompute_treed_paths(&BMODE_TREE));
+/// `KF_BMODE_BITS[above][left][mode]` — the §11.3 key-frame sub-block
+/// mode-signal cost in bits: [`treed_bits_cached`] over [`BMODE_PATHS`]
+/// against `KF_BMODE_PROB[above][left]`, for every context pair.
+static KF_BMODE_BITS: std::sync::LazyLock<[[[f64; 10]; 10]; 10]> = std::sync::LazyLock::new(|| {
+    core::array::from_fn(|above| {
+        core::array::from_fn(|left| {
+            let prob_row = &KF_BMODE_PROB[above][left];
+            core::array::from_fn(|mode| {
+                treed_bits_cached(&*BMODE_PATHS, |k| prob_row[k], mode as u8)
+            })
+        })
+    })
+});
 /// Precomputed paths for the §11.3 interframe intra luma mode tree.
 static IF_YMODE_PATHS: std::sync::LazyLock<[TreedLeafPath; 5]> =
     std::sync::LazyLock::new(|| precompute_treed_paths(&IF_YMODE_TREE));
@@ -2312,6 +2489,156 @@ fn estimate_block_bits(
     }
 
     bits
+}
+
+/// [`estimate_block_bits`] priced from the per-frame
+/// [`TrellisRateTables::step`] costs instead of per-step [`bool_bits`]
+/// calls. The accumulation visits the same terms in the same order, and
+/// each table entry is the very `f64` the direct call returns, so the sum
+/// is bit-for-bit the reference estimate
+/// (`estimate_block_bits_tabled_matches_direct`).
+fn estimate_block_bits_tabled(
+    tables: &TrellisRateTables,
+    block_type: BlockType,
+    above_has_nonzero: bool,
+    left_has_nonzero: bool,
+    coeffs: &[i16; 16],
+) -> f64 {
+    let first_coeff = block_type.first_coeff();
+    let plane_steps = &tables.step[block_type.plane_index()];
+    let paths = &*TOKEN_BIT_PATHS;
+
+    // One past the last non-zero scan position (`first_coeff` when none).
+    let mut end = 16;
+    while end > first_coeff && coeffs[end - 1] == 0 {
+        end -= 1;
+    }
+
+    let mut ctx3: usize = (above_has_nonzero as usize) + (left_has_nonzero as usize);
+    let mut prev_was_zero = false;
+    let mut bits = 0.0;
+    for (i, &v) in coeffs.iter().enumerate().take(end).skip(first_coeff) {
+        let steps = &plane_steps[COEFF_BANDS[i]][ctx3];
+        let abs_value = v.unsigned_abs();
+        let token = classify_coeff_token(abs_value);
+        let (path, len) = &paths[prev_was_zero as usize][token as usize];
+        for step in &path[..*len as usize] {
+            bits += steps[step.prob_index as usize][step.bit as usize];
+        }
+        if let Some((base, plist)) = cat_extras(token) {
+            let extra = abs_value.saturating_sub(base);
+            let n = plist.len();
+            for (j, &p) in plist.iter().enumerate() {
+                let bit = ((extra >> (n - 1 - j)) & 1) == 1;
+                bits += bool_bits(p, bit);
+            }
+        }
+        if abs_value != 0 {
+            bits += bool_bits(128, false);
+        }
+        ctx3 = level_ctx3(abs_value);
+        prev_was_zero = abs_value == 0;
+    }
+    if end < 16 {
+        // Explicit EOB: the root's left branch (node 0, bit 0). A block
+        // never ends on a literal zero, so the root is always reachable.
+        bits += plane_steps[COEFF_BANDS[end]][ctx3][0][0];
+    }
+    bits
+}
+
+/// [`estimate_block_bits`] from the pre-summed per-token rates
+/// ([`TrellisRateTables::small`] / [`TrellisRateTables::level_rate`] /
+/// [`TrellisRateTables::eob`]): one table read per coefficient instead of
+/// one per tree step.
+///
+/// It adds up exactly the terms the reference estimate adds, but grouped
+/// per token, so the two results can differ in the last few units of
+/// rounding and nowhere else. The mode pickers use it only to *rank*
+/// candidates, behind [`RD_TIE_GUARD`].
+fn estimate_block_bits_presummed(
+    tables: &TrellisRateTables,
+    block_type: BlockType,
+    above_has_nonzero: bool,
+    left_has_nonzero: bool,
+    coeffs: &[i16; 16],
+) -> f64 {
+    let first_coeff = block_type.first_coeff();
+    let plane = block_type.plane_index();
+    let small = &tables.small[plane];
+    let mut end = 16;
+    while end > first_coeff && coeffs[end - 1] == 0 {
+        end -= 1;
+    }
+    let mut ctx3: usize = (above_has_nonzero as usize) + (left_has_nonzero as usize);
+    let mut prev_was_zero = 0usize;
+    let mut bits = 0.0;
+    for (i, &v) in coeffs.iter().enumerate().take(end).skip(first_coeff) {
+        let level = v.unsigned_abs() as u32;
+        let band = COEFF_BANDS[i];
+        bits += if level <= TRELLIS_SMALL_LEVEL_MAX as u32 {
+            small[band][ctx3][prev_was_zero][level as usize]
+        } else {
+            TrellisRateTables::level_rate(
+                &small[band],
+                &tables.cat_path[plane][band],
+                ctx3,
+                prev_was_zero == 1,
+                level,
+            )
+        };
+        ctx3 = (level as usize).min(2);
+        prev_was_zero = (level == 0) as usize;
+    }
+    if end < 16 {
+        bits += tables.eob[plane][COEFF_BANDS[end]][ctx3];
+    }
+    bits
+}
+
+/// Margin below which two candidate costs ranked through
+/// [`estimate_block_bits_presummed`] are treated as undecided.
+///
+/// A pre-summed token-bit total and the reference total are two
+/// groupings of the same at most ~300 terms, each at most 8 bits, so they
+/// agree to within `2 · 300 · 2^-53 · 2400 < 2e-10` bits; scaled by a
+/// mode lambda of at most `157² / 32 < 771` and carried through the cost
+/// expression (magnitude below `4e6`, one unit of rounding `< 1e-9`), a
+/// ranking cost is within `2e-7` of the reference cost. When the leading
+/// candidate beats every other by more than this guard — four orders of
+/// magnitude wider — the reference costs order the same way with no tie,
+/// so the reference search would pick the same candidate. Anything
+/// closer is re-decided with the reference costs in the reference order.
+const RD_TIE_GUARD: f64 = 1e-3;
+
+#[cfg(test)]
+thread_local! {
+    /// When set, [`decisive_minimum`] reports every decision as
+    /// undecided, so the pickers run the reference search throughout —
+    /// the oracle `ranked_search_matches_reference_search` compares the
+    /// guarded ranking against.
+    static FORCE_REFERENCE_SEARCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The first minimum of `costs` and whether it leads every other entry
+/// by more than [`RD_TIE_GUARD`].
+fn decisive_minimum(costs: &[f64]) -> (usize, bool) {
+    let mut best = 0usize;
+    for (n, &cost) in costs.iter().enumerate().skip(1) {
+        if cost < costs[best] {
+            best = n;
+        }
+    }
+    // Test hook: route every decision through the reference search.
+    #[cfg(test)]
+    if FORCE_REFERENCE_SEARCH.with(|f| f.get()) {
+        return (best, false);
+    }
+    let decisive = costs
+        .iter()
+        .enumerate()
+        .all(|(n, &cost)| n == best || cost - costs[best] > RD_TIE_GUARD);
+    (best, decisive)
 }
 
 /// Fraction of the mode-decision Lagrange multiplier the §13 coefficient
@@ -2540,6 +2867,16 @@ struct TrellisRateTables {
     small: [[[[[f64; (TRELLIS_SMALL_LEVEL_MAX + 1) as usize]; 2]; 3]; 8]; 4],
     /// `eob[plane][band][ctx3]` — the exact [`eob_token_bits`] value.
     eob: [[[f64; 3]; 8]; 4],
+    /// `step[plane][band][ctx3][prob_index][bit]` — the exact
+    /// [`bool_bits`] cost of coding `bit` at §13.2 tree node
+    /// `prob_index` against `coeff_probs[plane][band][ctx3]`, the
+    /// per-step term [`estimate_block_bits`] accumulates.
+    step: [[[[[f64; 2]; 11]; 3]; 8]; 4],
+    /// `cat_path[plane][band][ctx3][prev_was_zero][cat]` — the §13.2
+    /// tree-path part of [`coeff_token_bits`] for the six extra-bit
+    /// tokens (`cat = token − Cat1`): the running sum that function holds
+    /// before it adds the value-dependent extra bits and the sign bit.
+    cat_path: [[[[[f64; 6]; 2]; 3]; 8]; 4],
 }
 
 impl TrellisRateTables {
@@ -2560,10 +2897,26 @@ impl TrellisRateTables {
         let mut tables = TrellisRateTables {
             small: [[[[[0.0; (TRELLIS_SMALL_LEVEL_MAX + 1) as usize]; 2]; 3]; 8]; 4],
             eob: [[[0.0; 3]; 8]; 4],
+            step: [[[[[0.0; 2]; 11]; 3]; 8]; 4],
+            cat_path: [[[[[0.0; 6]; 2]; 3]; 8]; 4],
         };
         for plane in 0..4 {
             for (band, &i) in band_pos.iter().enumerate() {
                 for ctx3 in 0..3 {
+                    let probs = &coeff_probs[plane][band][ctx3];
+                    for (node, costs) in tables.step[plane][band][ctx3].iter_mut().enumerate() {
+                        *costs = [bool_bits(probs[node], false), bool_bits(probs[node], true)];
+                    }
+                    for (pwz, slot) in tables.cat_path[plane][band][ctx3].iter_mut().enumerate() {
+                        for (cat, cell) in slot.iter_mut().enumerate() {
+                            let (path, len) = &TOKEN_BIT_PATHS[pwz][DctToken::Cat1 as usize + cat];
+                            let mut bits = 0.0;
+                            for step in &path[..*len as usize] {
+                                bits += bool_bits(probs[step.prob_index as usize], step.bit);
+                            }
+                            *cell = bits;
+                        }
+                    }
                     tables.eob[plane][band][ctx3] = eob_token_bits(coeff_probs, plane, i, ctx3);
                     for (pwz, slot) in tables.small[plane][band][ctx3].iter_mut().enumerate() {
                         for (abs, cell) in slot.iter_mut().enumerate() {
@@ -2576,21 +2929,79 @@ impl TrellisRateTables {
         }
         tables
     }
+
+    /// [`level_rate`](Self::level_rate) of one extra-bit level (`> 4`)
+    /// from all three contexts at once — context 0 with the given
+    /// "previous token was `DCT_0`" state, contexts 1 and 2 without (a
+    /// non-zero level precedes them). Each context's sum takes the same
+    /// additions in the same order as `level_rate`; only the token
+    /// classification and the extra-bit costs are shared.
+    #[inline]
+    fn cat_level_rates(cat_path: &[[[f64; 6]; 2]; 3], zero_run: usize, level: u32) -> [f64; 3] {
+        let abs_level = level as u16;
+        let token = classify_coeff_token(abs_level);
+        let cat = token as usize - DctToken::Cat1 as usize;
+        let mut rates = [
+            cat_path[0][zero_run][cat],
+            cat_path[1][0][cat],
+            cat_path[2][0][cat],
+        ];
+        if let Some((base, plist)) = cat_extras(token) {
+            let extra = abs_level.saturating_sub(base);
+            let n = plist.len();
+            for (j, &p) in plist.iter().enumerate() {
+                let cost = bool_bits(p, ((extra >> (n - 1 - j)) & 1) == 1);
+                for rate in rates.iter_mut() {
+                    *rate += cost;
+                }
+            }
+        }
+        let sign = bool_bits(128, false);
+        for rate in rates.iter_mut() {
+            *rate += sign;
+        }
+        rates
+    }
+
+    /// [`coeff_token_bits`] for any level from the tables of one
+    /// `(plane, band)` cell pair: a direct lookup up to level 4, else the
+    /// tabled tree-path sum followed by the same extra-bit and sign-bit
+    /// additions, in the same order (`level_rate_matches_coeff_token_bits`).
+    #[inline]
+    fn level_rate(
+        small: &[[[f64; (TRELLIS_SMALL_LEVEL_MAX + 1) as usize]; 2]; 3],
+        cat_path: &[[[f64; 6]; 2]; 3],
+        ctx3: usize,
+        prev_was_zero: bool,
+        level: u32,
+    ) -> f64 {
+        if level <= TRELLIS_SMALL_LEVEL_MAX as u32 {
+            return small[ctx3][prev_was_zero as usize][level as usize];
+        }
+        let abs_level = level as u16;
+        let token = classify_coeff_token(abs_level);
+        let mut bits =
+            cat_path[ctx3][prev_was_zero as usize][token as usize - DctToken::Cat1 as usize];
+        if let Some((base, plist)) = cat_extras(token) {
+            let extra = abs_level.saturating_sub(base);
+            let n = plist.len();
+            for (j, &p) in plist.iter().enumerate() {
+                let bit = ((extra >> (n - 1 - j)) & 1) == 1;
+                bits += bool_bits(p, bit);
+            }
+        }
+        bits += bool_bits(128, false);
+        bits
+    }
 }
 
-/// One Viterbi survivor at a scan position: the minimal accumulated
-/// `J = D + lambda·R` to *reach and code through* this position landing in
-/// the carried context, the chosen absolute level, and a back-pointer to
-/// the predecessor context.
+/// One Viterbi decision record of the retained test-module reference
+/// trellis: accumulated cost, chosen absolute level, predecessor context.
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct TrellisCell {
-    /// Accumulated `D + lambda·R` for coding positions `first..=i` with
-    /// this position's coefficient as the (current) last non-zero one,
-    /// i.e. *not yet* including any terminating EOB.
     cost: f64,
-    /// The chosen absolute level at this position.
     level: u16,
-    /// The predecessor context (`ctx3`) this survivor came from.
     prev_ctx: usize,
 }
 
@@ -2626,11 +3037,128 @@ struct TrellisBlockSpec {
 ///
 /// Falls back to plain rounding when `lambda <= 0` (lossless / qi-0 paths
 /// where the rate trade has no benefit), keeping those streams unchanged.
+///
+/// Two production forms share the recurrence of the retained test-module
+/// reference, evaluated in the same order with the same `f64` expressions
+/// (so every comparison, and therefore every chosen level, is identical):
+/// [`trellis_scan_tabled`] when per-frame rate tables are supplied and
+/// [`trellis_scan_direct`] otherwise. Both replace the per-coefficient
+/// divisions with an exact reciprocal multiply. Pinned level-for-level
+/// against the reference by `trellis_lut_and_early_exit_match_reference`.
 fn trellis_quantize_block(
     block: &mut [i16; 16],
     spec: TrellisBlockSpec,
     coeff_probs: &CoeffProbs,
     tables: Option<&TrellisRateTables>,
+    lambda: f64,
+) {
+    if lambda <= 0.0 {
+        enc_quantize_block_range(block, spec.dc, spec.ac, spec.first_coeff);
+        return;
+    }
+    match tables {
+        Some(tables) => trellis_scan_tabled(block, spec, tables, lambda),
+        None => trellis_scan_direct(block, spec, coeff_probs, lambda),
+    }
+}
+
+/// Scan-order view of one block for the trellis: coefficient magnitudes,
+/// signs, round-half-up candidate levels, the per-position drop-to-zero
+/// distortion with its suffix sums (accumulated from position 15
+/// downward), and the last position whose candidate level is non-zero.
+struct TrellisScan {
+    ax: [u32; 16],
+    negative: [bool; 16],
+    m_rounds: [u32; 16],
+    zero_dist: [f64; 16],
+    suffix_zero_dist: [f64; 17],
+    /// `None` when every in-scan coefficient rounds to level 0 — the
+    /// search then provably returns the all-zero block.
+    last_cand_nonzero: Option<usize>,
+}
+
+impl TrellisScan {
+    #[inline]
+    fn new(block: &[i16; 16], dc_q: u32, ac_q: u32, first_coeff: usize) -> Self {
+        let norms = &*IDCT_BASIS_NORM_SQ;
+        let mut scan = TrellisScan {
+            ax: [0; 16],
+            negative: [false; 16],
+            m_rounds: [0; 16],
+            zero_dist: [0.0; 16],
+            suffix_zero_dist: [0.0; 17],
+            last_cand_nonzero: None,
+        };
+        for k in (first_coeff..16).rev() {
+            let x = block[crate::dct_tokens::ZIGZAG[k]];
+            let q = if k == 0 { dc_q } else { ac_q };
+            let ax = x.unsigned_abs() as u32;
+            scan.ax[k] = ax;
+            scan.negative[k] = x < 0;
+            scan.m_rounds[k] = rounded_level(ax, q);
+            if scan.m_rounds[k] != 0 && scan.last_cand_nonzero.is_none() {
+                scan.last_cand_nonzero = Some(k);
+            }
+            scan.zero_dist[k] = norms[k] * (ax as u64 * ax as u64) as f64;
+            scan.suffix_zero_dist[k] = scan.suffix_zero_dist[k + 1] + scan.zero_dist[k];
+        }
+        scan
+    }
+
+    /// Transform-domain distortion of coding position `k` at `level`.
+    #[inline]
+    fn dist(&self, k: usize, level: u32, q: u32) -> f64 {
+        let err = self.ax[k] as i64 - level as i64 * q as i64;
+        IDCT_BASIS_NORM_SQ[k] * (err * err) as f64
+    }
+}
+
+/// `if take { a } else { b }` — written as a value selection so the
+/// trellis step compiles to conditional moves rather than
+/// data-dependent branches.
+#[inline(always)]
+fn select<T: Copy>(take: bool, a: T, b: T) -> T {
+    if take { a } else { b }
+}
+
+/// The first minimum of three costs and its index: a later entry wins
+/// only when strictly smaller.
+#[inline(always)]
+fn first_min3(c: [f64; 3]) -> (f64, u8) {
+    let lt1 = c[1] < c[0];
+    let m01 = select(lt1, c[1], c[0]);
+    let i01 = lt1 as u8;
+    let lt2 = c[2] < m01;
+    (select(lt2, c[2], m01), select(lt2, 2, i01))
+}
+
+/// The trellis against the per-frame [`TrellisRateTables`].
+///
+/// Same recurrence and evaluation order as [`trellis_scan_direct`], with
+/// the step specialised by the position's rounded level `m`. The
+/// candidates are `m`, `m − 1` and `0` (those that exist) and the carried
+/// context of a level is `min(level, 2)`, so:
+///
+/// * context 0 is only ever reached by level 0;
+/// * context 1 by level 1 — the `m` candidate when `m = 1`, the `m − 1`
+///   candidate when `m = 2`;
+/// * context 2 by `m` when `m ≥ 2` and by `m − 1` when `m ≥ 3`.
+///
+/// Each next-context survivor is therefore the first minimum over a fixed
+/// list of `(incoming context, candidate)` costs in the reference order
+/// (incoming context outer, `m` before `m − 1`), which [`first_min3`]
+/// reduces pairwise — a later entry wins only when strictly smaller at
+/// every level, so ties resolve exactly as the sequential scan does. A
+/// dead incoming context carries infinite cost and loses every strict
+/// comparison just as if it had been skipped (no cost is ever NaN).
+///
+/// A survivor in context 0 always arrived through a literal zero except
+/// before the first position, so the "previous token was `DCT_0`" flag
+/// needs no per-survivor storage.
+fn trellis_scan_tabled(
+    block: &mut [i16; 16],
+    spec: TrellisBlockSpec,
+    tables: &TrellisRateTables,
     lambda: f64,
 ) {
     let TrellisBlockSpec {
@@ -2640,261 +3168,329 @@ fn trellis_quantize_block(
         entry_ctx3,
         plane,
     } = spec;
-    // `lambda` is the **effective** coefficient-level price the caller has
-    // already scaled down from the mode-decision multiplier (coefficient
-    // RDO spends `lambda` far more effectively than the mode-granular
-    // picker — it can drop one trailing coefficient rather than a whole
-    // mode — so the raw mode lambda over-trades quality for rate). The
-    // scale is resolved by [`MbRdCtx::trellis_lambda`] from the
-    // [`TrellisStrength`] knob; this entry consumes the resolved value
-    // directly so callers can dial the rate/quality trade per stream.
+    let norms: &[f64; 16] = &IDCT_BASIS_NORM_SQ;
+    let (dc_q, ac_q) = (dc as u32, ac as u32);
 
-    // Baseline rounding for the lossless / no-trade path.
-    if lambda <= 0.0 {
-        enc_quantize_block_range(block, dc, ac, first_coeff);
-        return;
+    // Scan-order magnitudes, sign / non-zero-candidate bitmaps and
+    // round-half-up candidate levels.
+    let mut ax = [0u32; 16];
+    let mut m_rounds = [0u32; 16];
+    let mut negative = 0u32;
+    let mut candidate = 0u32;
+    for k in first_coeff..16 {
+        let x = block[crate::dct_tokens::ZIGZAG[k]];
+        ax[k] = x.unsigned_abs() as u32;
+        negative |= ((x < 0) as u32) << k;
+        let q = if k == 0 { dc_q } else { ac_q };
+        m_rounds[k] = rounded_level(ax[k], q);
+        candidate |= ((m_rounds[k] != 0) as u32) << k;
     }
-
-    // Scan-order view of the unquantised coefficients + per-position step
-    // + the round-half-away-from-zero candidate magnitude per position.
-    let mut scan_x = [0i32; 16];
-    let mut step = [0i32; 16];
-    let mut m_rounds = [0i64; 16];
-    let mut last_cand_nonzero: i32 = -1;
-    for k in 0..16 {
-        scan_x[k] = block[crate::dct_tokens::ZIGZAG[k]] as i32;
-        step[k] = if k == 0 { dc as i32 } else { ac as i32 };
-        let q = step[k] as i64;
-        m_rounds[k] = (scan_x[k].unsigned_abs() as i64 + q / 2) / q;
-        if k >= first_coeff && m_rounds[k] != 0 {
-            last_cand_nonzero = k as i32;
-        }
-    }
-
-    // Sub-threshold early exit: when every in-scan coefficient rounds to
-    // magnitude 0 the candidate set at every position is exactly `{0}`,
-    // so every survivor carries level 0, no terminating position ever
-    // qualifies (`cell.level != 0` never holds), and the traceback below
-    // provably writes an all-zero block. Emit that block directly.
-    if last_cand_nonzero < 0 {
+    if candidate == 0 {
         *block = [0i16; 16];
         return;
     }
+    let last = 31 - candidate.leading_zeros() as usize;
 
-    let norms = &*IDCT_BASIS_NORM_SQ;
-
-    // Per-frame rate LUT views for this block's `plane` (see
-    // [`TrellisRateTables`] — lookups are bit-for-bit the direct-call
-    // values, so costs and decisions cannot move; `None` falls back to
-    // the direct reference calls).
-    let small_rates = tables.map(|t| &t.small[plane]);
-    let eob_rates = tables.map(|t| &t.eob[plane]);
-
-    // Distortion of coding scan position `k` at absolute level `m`
-    // (transform-domain squared error scaled by the basis norm). `m` is a
-    // magnitude (≥ 0); the dequantised coefficient carries `scan_x[k]`'s
-    // sign, so the error is computed on absolute magnitudes.
-    let dist = |k: usize, m: i64| -> f64 {
-        let q = step[k] as i64;
-        let recon = m * q;
-        let err = (scan_x[k] as i64).abs() - recon;
+    // Drop-to-zero distortion per position and its suffix sums,
+    // accumulated from position 15 downward.
+    let mut zero_dist = [0f64; 16];
+    let mut suffix_zero_dist = [0f64; 17];
+    for k in first_coeff..16 {
+        zero_dist[k] = norms[k] * (ax[k] as u64 * ax[k] as u64) as f64;
+    }
+    for k in (first_coeff..16).rev() {
+        suffix_zero_dist[k] = suffix_zero_dist[k + 1] + zero_dist[k];
+    }
+    let dist = |k: usize, level: u32, q: u32| -> f64 {
+        let err = ax[k] as i64 - level as i64 * q as i64;
         norms[k] * (err * err) as f64
     };
 
-    // Suffix distortion of *dropping* every position k..16 to level 0 —
-    // the distortion the §13.3 implicit/explicit EOB tail pays for the
-    // coefficients past the last coded one. `suffix_zero_dist[k]` =
-    // Σ_{j=k}^{15} dist(j, 0). Without this, terminating early would hide
-    // the energy of the dropped tail and the trellis would zero
-    // everything. `suffix_zero_dist[16] = 0`.
-    let mut suffix_zero_dist = [0f64; 17];
-    let mut zero_dist = [0f64; 16];
-    for k in (first_coeff..16).rev() {
-        zero_dist[k] = dist(k, 0);
-        suffix_zero_dist[k] = suffix_zero_dist[k + 1] + zero_dist[k];
-    }
+    let small = &tables.small[plane];
+    let cat_path = &tables.cat_path[plane];
+    let eob = &tables.eob[plane];
 
-    // Forward Viterbi. State = carried `ctx3 ∈ {0,1,2}`. `cells[k]` holds
-    // the best survivor *ending at* scan position `k` with each carried
-    // context, where "ending" means position `k` holds the last coded
-    // (possibly non-zero) coefficient so far. We also separately track the
-    // running all-zero-prefix cost so a block can terminate with EOB at
-    // `first_coeff` (entirely zero) for free of trailing-token bits.
-    //
-    // `prev[ctx]` is the best (cost, level, prev_ctx, prev_was_zero) to
-    // arrive at the *current* position carrying `ctx`.
     const INF: f64 = f64::INFINITY;
+    let mut surv = [INF, INF, INF];
+    surv[entry_ctx3] = 0.0;
+    let mut zero_run = 0usize;
+    // Per position: predecessor context of each carried context, and the
+    // level behind carried context 2 (contexts 0 / 1 imply levels 0 / 1).
+    let mut choice_prev = [[0u8; 3]; 16];
+    let mut choice_level2 = [0u16; 16];
 
-    // survivor reaching position `k` with carried ctx — initialised at the
-    // virtual "before first_coeff" boundary: a single state carrying
-    // `entry_ctx3`, cost 0, prev_was_zero = false (the first token may emit
-    // EOB).
-    #[derive(Clone, Copy)]
-    struct Surv {
-        cost: f64,
-        prev_was_zero: bool,
-        // back-pointer chain stored in `choice` below
-    }
-    let mut surv = [Surv {
-        cost: INF,
-        prev_was_zero: false,
-    }; 3];
-    surv[entry_ctx3] = Surv {
-        cost: 0.0,
-        prev_was_zero: false,
-    };
-
-    // Decision record per (position, carried-ctx): the level chosen at this
-    // position and which predecessor ctx it came from, for traceback.
-    let mut choice = [[TrellisCell {
-        cost: INF,
-        level: 0,
-        prev_ctx: 0,
-    }; 3]; 16];
-
-    // Best terminating survivor: code positions first..=t, then EOB after
-    // t (if t+1 < 16) or implicit EOB. `best_end_pos = first_coeff - 1`
-    // (sentinel `usize::MAX` meaning "all zero") seeds the all-zero block.
-    let mut best_term_cost = {
-        // All-zero block: EOB token at `first_coeff` against the entry ctx,
-        // plus the distortion of dropping every coefficient to zero.
-        let mut c = INF;
-        let s = &surv[entry_ctx3];
-        if s.cost < INF {
-            let eob_r = match eob_rates {
-                Some(e) => e[COEFF_BANDS[first_coeff]][entry_ctx3],
-                None => eob_token_bits(coeff_probs, plane, first_coeff, entry_ctx3),
-            };
-            c = s.cost + lambda * eob_r + suffix_zero_dist[first_coeff];
-        }
-        c
-    };
-    let mut best_term_pos: i32 = -1; // -1 ⇒ all-zero
+    let mut best_term_cost =
+        0.0 + lambda * eob[COEFF_BANDS[first_coeff]][entry_ctx3] + suffix_zero_dist[first_coeff];
+    let mut best_term_pos = usize::MAX;
     let mut best_term_ctx = entry_ctx3;
 
-    // Positions past `last_cand_nonzero` admit only the level-0 candidate:
-    // they can never become a terminating (non-zero last-coded) slot, the
-    // traceback never starts past `best_term_pos` (which needs a non-zero
-    // level), and the tail's drop-to-zero distortion is already priced by
-    // `suffix_zero_dist` in every termination cost — so the scan over them
-    // is dead work and stops here, with identical output.
-    for k in first_coeff..=(last_cand_nonzero as usize) {
-        let m_round = m_rounds[k];
+    for k in first_coeff..=last {
+        let m = m_rounds[k];
         let band = COEFF_BANDS[k];
-        // Candidate magnitudes: round and round-1 (≥0), deduplicated, plus
-        // a forced 0 so a non-trivial coefficient can still be dropped.
-        let mut cands = [0i64; 3];
-        let mut ncand = 0usize;
-        for cand in [m_round, m_round - 1, 0] {
-            if cand >= 0 && !cands[..ncand].contains(&cand) {
-                cands[ncand] = cand;
-                ncand += 1;
+        let q = if k == 0 { dc_q } else { ac_q };
+        let band_small = &small[band];
+        let rows = [
+            &band_small[0][zero_run],
+            &band_small[1][0],
+            &band_small[2][0],
+        ];
+        let [s0, s1, s2] = surv;
+
+        // Context 0: first minimum of the level-0 costs.
+        let d_zero = zero_dist[k];
+        let (n0, p0) = first_min3([
+            s0 + d_zero + lambda * rows[0][0],
+            s1 + d_zero + lambda * rows[1][0],
+            s2 + d_zero + lambda * rows[2][0],
+        ]);
+        // The costs of coding one non-zero `level` from each context.
+        let level_costs = |level: u32| -> [f64; 3] {
+            let d = dist(k, level, q);
+            if level <= TRELLIS_SMALL_LEVEL_MAX as u32 {
+                [
+                    s0 + d + lambda * rows[0][level as usize],
+                    s1 + d + lambda * rows[1][level as usize],
+                    s2 + d + lambda * rows[2][level as usize],
+                ]
+            } else {
+                let rates = TrellisRateTables::cat_level_rates(&cat_path[band], zero_run, level);
+                [
+                    s0 + d + lambda * rates[0],
+                    s1 + d + lambda * rates[1],
+                    s2 + d + lambda * rates[2],
+                ]
             }
+        };
+        let (n1, p1, n2, p2, l2) = match m {
+            0 => (INF, 0, INF, 0, 0),
+            1 => {
+                let (n1, p1) = first_min3(level_costs(1));
+                (n1, p1, INF, 0, 0)
+            }
+            2 => {
+                let (n2, p2) = first_min3(level_costs(2));
+                let (n1, p1) = first_min3(level_costs(1));
+                (n1, p1, n2, p2, 2)
+            }
+            _ => {
+                // `m` then `m − 1` per incoming context, then across
+                // contexts.
+                let high = level_costs(m);
+                let low = level_costs(m - 1);
+                let take_low = [low[0] < high[0], low[1] < high[1], low[2] < high[2]];
+                let (n2, p2) = first_min3([
+                    select(take_low[0], low[0], high[0]),
+                    select(take_low[1], low[1], high[1]),
+                    select(take_low[2], low[2], high[2]),
+                ]);
+                (INF, 0, n2, p2, m - take_low[p2 as usize] as u32)
+            }
+        };
+        choice_prev[k] = [p0, p1, p2];
+        choice_level2[k] = l2 as u16;
+
+        // Terminating after position k needs a non-zero level there:
+        // carried context 1, then 2. A dead survivor's infinite cost
+        // never beats the (finite) running best.
+        if m != 0 {
+            let (t1, t2) = if k + 1 < 16 {
+                let eob_next = &eob[COEFF_BANDS[k + 1]];
+                let tail = suffix_zero_dist[k + 1];
+                (
+                    n1 + lambda * eob_next[1] + tail,
+                    n2 + lambda * eob_next[2] + tail,
+                )
+            } else {
+                (n1, n2)
+            };
+            let better = t1 < best_term_cost;
+            best_term_cost = select(better, t1, best_term_cost);
+            best_term_pos = select(better, k, best_term_pos);
+            best_term_ctx = select(better, 1, best_term_ctx);
+            let better = t2 < best_term_cost;
+            best_term_cost = select(better, t2, best_term_cost);
+            best_term_pos = select(better, k, best_term_pos);
+            best_term_ctx = select(better, 2, best_term_ctx);
         }
 
-        let mut next = [Surv {
-            cost: INF,
-            prev_was_zero: false,
-        }; 3];
-        let mut next_choice = [TrellisCell {
-            cost: INF,
-            level: 0,
-            prev_ctx: 0,
-        }; 3];
+        surv = [n0, n1, n2];
+        zero_run = 1;
+    }
 
-        // Distortion depends only on the candidate magnitude, not on the
-        // carried context — compute each candidate's term once (the m = 0
-        // slot reuses the cached drop-to-zero value bit-for-bit).
+    *block = [0i16; 16];
+    if best_term_pos != usize::MAX {
+        let mut k = best_term_pos;
+        let mut ctx = best_term_ctx;
+        loop {
+            let level = match ctx {
+                0 => 0,
+                1 => 1,
+                _ => choice_level2[k] as i16,
+            };
+            block[crate::dct_tokens::ZIGZAG[k]] = if (negative >> k) & 1 != 0 {
+                -level
+            } else {
+                level
+            };
+            if k == first_coeff {
+                break;
+            }
+            ctx = choice_prev[k][ctx] as usize;
+            k -= 1;
+        }
+    }
+}
+
+/// The trellis pricing every token through the direct reference rate
+/// functions — the path the per-macroblock public entries take when no
+/// per-frame tables exist. Level-for-level identical to
+/// [`trellis_scan_tabled`].
+fn trellis_scan_direct(
+    block: &mut [i16; 16],
+    spec: TrellisBlockSpec,
+    coeff_probs: &CoeffProbs,
+    lambda: f64,
+) {
+    let TrellisBlockSpec {
+        dc,
+        ac,
+        first_coeff,
+        entry_ctx3,
+        plane,
+    } = spec;
+    let (dc_q, ac_q) = (dc as u32, ac as u32);
+    let scan = TrellisScan::new(block, dc_q, ac_q, first_coeff);
+    let Some(last) = scan.last_cand_nonzero else {
+        *block = [0i16; 16];
+        return;
+    };
+
+    const INF: f64 = f64::INFINITY;
+    // Survivor per carried context: accumulated cost and whether the
+    // coefficient that produced it was a literal zero.
+    let mut surv_cost = [INF; 3];
+    let mut surv_pwz = [false; 3];
+    surv_cost[entry_ctx3] = 0.0;
+    // Decision records for the traceback.
+    let mut choice_level = [[0u16; 3]; 16];
+    let mut choice_prev = [[0u8; 3]; 16];
+
+    let entry_eob = eob_token_bits(coeff_probs, plane, first_coeff, entry_ctx3);
+    let mut best_term_cost = 0.0 + lambda * entry_eob + scan.suffix_zero_dist[first_coeff];
+    let mut best_term_pos = usize::MAX;
+    let mut best_term_ctx = entry_ctx3;
+
+    for k in first_coeff..=last {
+        let m = scan.m_rounds[k];
+        let q = if k == 0 { dc_q } else { ac_q };
+        // Candidates in evaluation order: the rounded level, one below it,
+        // and zero — without repeats.
+        let cands = [m, m.saturating_sub(1), 0];
+        let ncand = (m as usize).min(2) + 1;
         let mut cand_dist = [0f64; 3];
-        for (slot, &m) in cand_dist.iter_mut().zip(&cands[..ncand]) {
-            *slot = if m == 0 { zero_dist[k] } else { dist(k, m) };
+        for c in 0..ncand {
+            cand_dist[c] = if cands[c] == 0 {
+                scan.zero_dist[k]
+            } else {
+                scan.dist(k, cands[c], q)
+            };
         }
 
-        for (in_ctx, &s) in surv.iter().enumerate() {
-            if s.cost >= INF {
+        let mut next_cost = [INF; 3];
+        let mut next_pwz = [false; 3];
+        let mut next_level = [0u16; 3];
+        let mut next_prev = [0u8; 3];
+        for in_ctx in 0..3 {
+            let base = surv_cost[in_ctx];
+            if base >= INF {
                 continue;
             }
-            for (&m, &d) in cands[..ncand].iter().zip(&cand_dist[..ncand]) {
-                let abs = m as u16;
-                let r = match small_rates {
-                    Some(t) if abs <= TRELLIS_SMALL_LEVEL_MAX => {
-                        t[band][in_ctx][s.prev_was_zero as usize][abs as usize]
-                    }
-                    _ => coeff_token_bits(coeff_probs, plane, k, in_ctx, s.prev_was_zero, abs),
-                };
-                let cost = s.cost + d + lambda * r;
-                let out_ctx = level_ctx3(abs);
-                if cost < next[out_ctx].cost {
-                    next[out_ctx] = Surv {
-                        cost,
-                        prev_was_zero: abs == 0,
-                    };
-                    next_choice[out_ctx] = TrellisCell {
-                        cost,
-                        level: abs,
-                        prev_ctx: in_ctx,
-                    };
+            let pwz = surv_pwz[in_ctx];
+            for c in 0..ncand {
+                let level = cands[c];
+                let r = coeff_token_bits(coeff_probs, plane, k, in_ctx, pwz, level as u16);
+                let cost = base + cand_dist[c] + lambda * r;
+                let out_ctx = level_ctx3(level as u16);
+                if cost < next_cost[out_ctx] {
+                    next_cost[out_ctx] = cost;
+                    next_pwz[out_ctx] = level == 0;
+                    next_level[out_ctx] = level as u16;
+                    next_prev[out_ctx] = in_ctx as u8;
                 }
             }
         }
+        choice_level[k] = next_level;
+        choice_prev[k] = next_prev;
 
-        choice[k] = next_choice;
-
-        // Consider terminating *after* position k: position k must hold a
-        // non-zero coefficient to be a meaningful last-coded slot (a zero
-        // last slot is dominated by terminating one position earlier). The
-        // EOB after position k lands at k+1 (if any) against k's out-ctx;
-        // at k = 15 the implicit EOB costs nothing.
-        for (out_ctx, &cell) in next_choice.iter().enumerate() {
-            if cell.cost >= INF || cell.level == 0 {
+        // Terminating after position k needs a non-zero level there, i.e.
+        // a survivor in carried context 1 or 2 (context 0 is reached only
+        // through level 0).
+        for (out_ctx, &cost) in next_cost.iter().enumerate().skip(1) {
+            if cost >= INF {
                 continue;
             }
-            // `cell.cost` covers coding first..=k; add the EOB token (if
-            // any remain) plus the distortion of dropping positions k+1..16.
             let term_cost = if k + 1 < 16 {
-                let eob_r = match eob_rates {
-                    Some(e) => e[COEFF_BANDS[k + 1]][out_ctx],
-                    None => eob_token_bits(coeff_probs, plane, k + 1, out_ctx),
-                };
-                cell.cost + lambda * eob_r + suffix_zero_dist[k + 1]
+                cost + lambda * eob_token_bits(coeff_probs, plane, k + 1, out_ctx)
+                    + scan.suffix_zero_dist[k + 1]
             } else {
-                cell.cost // implicit EOB after the last coefficient
+                cost
             };
             if term_cost < best_term_cost {
                 best_term_cost = term_cost;
-                best_term_pos = k as i32;
+                best_term_pos = k;
                 best_term_ctx = out_ctx;
             }
         }
 
-        surv = next;
+        surv_cost = next_cost;
+        surv_pwz = next_pwz;
     }
 
-    // Traceback from the best terminating position, writing scan-order
-    // levels then permuting back to raster.
-    let mut scan_levels = [0i32; 16];
-    if best_term_pos >= 0 {
-        let mut k = best_term_pos as usize;
+    *block = [0i16; 16];
+    if best_term_pos != usize::MAX {
+        let mut k = best_term_pos;
         let mut ctx = best_term_ctx;
         loop {
-            let cell = choice[k][ctx];
-            let lvl = cell.level as i32;
-            let signed = if scan_x[k] < 0 { -lvl } else { lvl };
-            scan_levels[k] = signed;
+            let level = choice_level[k][ctx] as i16;
+            block[crate::dct_tokens::ZIGZAG[k]] = if scan.negative[k] { -level } else { level };
             if k == first_coeff {
                 break;
             }
-            ctx = cell.prev_ctx;
+            ctx = choice_prev[k][ctx] as usize;
             k -= 1;
         }
     }
+}
 
-    // Permute scan levels back into the raster `block`.
-    for v in block.iter_mut() {
-        *v = 0;
+/// `QUANT_RECIPROCAL[q] = floor(2^32 / q) + 1` for `q` in `1..1024` — the
+/// multiplier that turns the trellis's round-half-up division into one
+/// multiply and shift (see [`rounded_level`]).
+const QUANT_RECIPROCAL: [u64; 1024] = {
+    let mut table = [0u64; 1024];
+    let mut q = 1usize;
+    while q < 1024 {
+        table[q] = (1u64 << 32) / q as u64 + 1;
+        q += 1;
     }
-    for (k, &lvl) in scan_levels.iter().enumerate() {
-        block[crate::dct_tokens::ZIGZAG[k]] = lvl as i16;
+    table
+};
+
+/// `floor((magnitude + q / 2) / q)` — the round-half-up quantised level of
+/// a coefficient magnitude at step `q`.
+///
+/// For `q < 1024` (every §14.1 step is far below that) the quotient comes
+/// from a reciprocal multiply. With `r = floor(2^32 / q) + 1` we have
+/// `r·q = 2^32 + e`, `0 < e <= q`, so `n·r / 2^32 = n/q + n·e / (q·2^32)`;
+/// the excess stays below `1/q` — too small to carry the value across the
+/// next integer — whenever `n·e < 2^32`, which `n < 2^17`, `q < 2^10`
+/// guarantees. `rounded_level_matches_division` checks every pair.
+#[inline(always)]
+fn rounded_level(magnitude: u32, q: u32) -> u32 {
+    let n = magnitude as u64 + (q / 2) as u64;
+    if (q as usize) < QUANT_RECIPROCAL.len() && q != 0 {
+        ((n * QUANT_RECIPROCAL[q as usize]) >> 32) as u32
+    } else {
+        (n / q as u64) as u32
     }
 }
 
@@ -2951,6 +3547,64 @@ impl MbRdCtx<'_> {
     #[inline]
     fn trellis_active(&self) -> bool {
         self.trellis_lambda() > 0.0
+    }
+
+    /// Token bits of one scan-order block for *ranking* candidates: the
+    /// pre-summed estimate when per-frame tables are attached (see
+    /// [`RD_TIE_GUARD`]), else the reference estimate itself.
+    #[inline]
+    fn ranking_block_bits(
+        &self,
+        block_type: BlockType,
+        above_has_nonzero: bool,
+        left_has_nonzero: bool,
+        coeffs: &[i16; 16],
+    ) -> f64 {
+        match self.rate_tables {
+            Some(tables) => estimate_block_bits_presummed(
+                tables,
+                block_type,
+                above_has_nonzero,
+                left_has_nonzero,
+                coeffs,
+            ),
+            None => estimate_block_bits(
+                block_type,
+                self.coeff_probs,
+                above_has_nonzero,
+                left_has_nonzero,
+                coeffs,
+            ),
+        }
+    }
+
+    /// §13.3 token bits of one scan-order block — [`estimate_block_bits`],
+    /// priced from the per-frame step table when one is attached (the
+    /// two forms return the identical `f64`).
+    #[inline]
+    fn block_bits(
+        &self,
+        block_type: BlockType,
+        above_has_nonzero: bool,
+        left_has_nonzero: bool,
+        coeffs: &[i16; 16],
+    ) -> f64 {
+        match self.rate_tables {
+            Some(tables) => estimate_block_bits_tabled(
+                tables,
+                block_type,
+                above_has_nonzero,
+                left_has_nonzero,
+                coeffs,
+            ),
+            None => estimate_block_bits(
+                block_type,
+                self.coeff_probs,
+                above_has_nonzero,
+                left_has_nonzero,
+                coeffs,
+            ),
+        }
     }
 }
 
@@ -3170,10 +3824,14 @@ fn reconstruct_whole_block_luma(
 /// matches the relative ranking the frame-shared contexts produce (a
 /// neighbour's non-zero state shifts every candidate's first-band cost by
 /// the same amount, so it does not change the winner).
+///
+/// `ranking` selects the pre-summed per-block estimate (see
+/// [`RD_TIE_GUARD`]); `false` is the reference estimate.
 fn estimate_whole_block_luma_bits(
-    coeff_probs: &CoeffProbs,
+    rd: &MbRdCtx,
     y_quant: &[[i16; 16]; 16],
     y2_quant: &[i16; 16],
+    ranking: bool,
 ) -> f64 {
     let mut above = MbEntropyCtx::default();
     let mut left = MbEntropyCtx::default();
@@ -3183,23 +3841,52 @@ fn estimate_whole_block_luma_bits(
     bits += estimate_block_bits_with_ctx(
         24,
         BlockType::Y2,
-        coeff_probs,
+        rd,
         &scan_y2,
         &mut above,
         &mut left,
+        ranking,
     );
     for (i, blk) in y_quant.iter().enumerate() {
         let scan = raster_to_scan(blk);
         bits += estimate_block_bits_with_ctx(
             i,
             BlockType::YAfterY2,
-            coeff_probs,
+            rd,
             &scan,
             &mut above,
             &mut left,
+            ranking,
         );
     }
     bits
+}
+
+/// §13.3 token bits of the eight chroma blocks of one candidate (4 U
+/// sub-blocks 16..19, then 4 V 20..23), threading the local above / left
+/// non-zero contexts. `ranking` as in [`estimate_whole_block_luma_bits`].
+fn estimate_chroma_bits(
+    rd: &MbRdCtx,
+    u_quant: &[[i16; 16]; 4],
+    v_quant: &[[i16; 16]; 4],
+    ranking: bool,
+) -> f64 {
+    let mut above = MbEntropyCtx::default();
+    let mut left = MbEntropyCtx::default();
+    let mut token_bits = 0.0;
+    for (i, blk) in u_quant.iter().chain(v_quant.iter()).enumerate() {
+        let scan = raster_to_scan(blk);
+        token_bits += estimate_block_bits_with_ctx(
+            16 + i,
+            BlockType::UV,
+            rd,
+            &scan,
+            &mut above,
+            &mut left,
+            ranking,
+        );
+    }
+    token_bits
 }
 
 /// Bit cost of one residual block at `block_index`, threading the §13.3
@@ -3208,10 +3895,11 @@ fn estimate_whole_block_luma_bits(
 fn estimate_block_bits_with_ctx(
     block_index: usize,
     block_type: BlockType,
-    coeff_probs: &CoeffProbs,
+    rd: &MbRdCtx,
     scan_coeffs: &[i16; 16],
     above: &mut MbEntropyCtx,
     left: &mut MbEntropyCtx,
+    ranking: bool,
 ) -> f64 {
     const LEFT_CTX: [usize; 25] = [
         0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8,
@@ -3221,13 +3909,12 @@ fn estimate_block_bits_with_ctx(
     ];
     let a_slot = ABOVE_CTX[block_index];
     let l_slot = LEFT_CTX[block_index];
-    let bits = estimate_block_bits(
-        block_type,
-        coeff_probs,
-        above.nonzero[a_slot],
-        left.nonzero[l_slot],
-        scan_coeffs,
-    );
+    let (a_nonzero, l_nonzero) = (above.nonzero[a_slot], left.nonzero[l_slot]);
+    let bits = if ranking {
+        rd.ranking_block_bits(block_type, a_nonzero, l_nonzero, scan_coeffs)
+    } else {
+        rd.block_bits(block_type, a_nonzero, l_nonzero, scan_coeffs)
+    };
     let first = block_type.first_coeff();
     let has_coeffs = scan_coeffs[first..].iter().any(|&v| v != 0);
     above.nonzero[a_slot] = has_coeffs;
@@ -3256,8 +3943,13 @@ fn pick_y16x16_mode(
 ) -> WholeBlockLuma {
     const CANDIDATES: [IntraYMode; 4] =
         [IntraYMode::Dc, IntraYMode::V, IntraYMode::H, IntraYMode::Tm];
-    let mut best: Option<WholeBlockLuma> = None;
-    for &mode in &CANDIDATES {
+    // Every candidate goes through the full chain; the token bits are
+    // first taken from the pre-summed ranking estimate.
+    let mut quant = [([[0i16; 16]; 16], [0i16; 16]); 4];
+    let mut ssd = [0f64; 4];
+    let mut mode_bits = [0f64; 4];
+    let mut ranking_cost = [0f64; 4];
+    for (n, &mode) in CANDIDATES.iter().enumerate() {
         let mut pred = [0u8; 256];
         // predict_y16x16 returns None only for B_PRED, which is not in
         // CANDIDATES, so this is always Some.
@@ -3265,21 +3957,40 @@ fn pick_y16x16_mode(
 
         let (y_quant, y2_quant) = transform_whole_block_luma_rd(src, &pred, rd.factors, Some(rd));
         let recon = reconstruct_whole_block_luma(&pred, &y_quant, &y2_quant, rd.factors);
-        let ssd = block_ssd(&recon, src) as f64;
-        let token_bits = estimate_whole_block_luma_bits(rd.coeff_probs, &y_quant, &y2_quant);
-        let mode_bits = treed_bits_cached(&*KF_YMODE_PATHS, |i| KF_YMODE_PROB[i], mode.leaf());
-        let rd_cost = ssd + rd.lambda * (token_bits + mode_bits);
-
-        if best.as_ref().map(|b| rd_cost < b.rd_cost).unwrap_or(true) {
-            best = Some(WholeBlockLuma {
-                mode,
-                y_coeffs: y_quant,
-                y2_coeffs: y2_quant,
-                rd_cost,
-            });
-        }
+        ssd[n] = block_ssd(&recon, src) as f64;
+        mode_bits[n] = treed_bits_cached(&*KF_YMODE_PATHS, |i| KF_YMODE_PROB[i], mode.leaf());
+        let token_bits = estimate_whole_block_luma_bits(rd, &y_quant, &y2_quant, true);
+        ranking_cost[n] = ssd[n] + rd.lambda * (token_bits + mode_bits[n]);
+        quant[n] = (y_quant, y2_quant);
     }
-    best.expect("CANDIDATES is non-empty")
+    // The reference cost of a candidate: exact token bits.
+    let reference_cost = |n: usize| {
+        let token_bits = estimate_whole_block_luma_bits(rd, &quant[n].0, &quant[n].1, false);
+        ssd[n] + rd.lambda * (token_bits + mode_bits[n])
+    };
+    let (leader, decisive) = decisive_minimum(&ranking_cost);
+    let (winner, rd_cost) = if decisive {
+        (leader, reference_cost(leader))
+    } else {
+        // Too close to call on the ranking estimate: the reference
+        // search — first strictly smaller reference cost wins.
+        let mut winner = 0usize;
+        let mut best_cost = reference_cost(0);
+        for n in 1..CANDIDATES.len() {
+            let cost = reference_cost(n);
+            if cost < best_cost {
+                best_cost = cost;
+                winner = n;
+            }
+        }
+        (winner, best_cost)
+    };
+    WholeBlockLuma {
+        mode: CANDIDATES[winner],
+        y_coeffs: quant[winner].0,
+        y2_coeffs: quant[winner].1,
+        rd_cost,
+    }
 }
 
 /// One chroma plane's source pixels plus its three §12 prediction
@@ -3374,23 +4085,25 @@ fn reconstruct_chroma_plane(
 /// candidate is reconstructed through the full §14 chain; `D` is the
 /// summed self-decode SSD across U and V, `R` the eight §13.3 `UV`-block
 /// token bits plus the §11.4 chroma-mode-signal bits. Returns the joint
-/// winner plus both prediction buffers.
+/// winner plus its quantised `U` / `V` blocks (the blocks the residual
+/// pass emits — re-deriving them would repeat the same deterministic
+/// transform and quantisation).
 fn pick_uv8x8_mode(
     u: &ChromaPlane,
     v: &ChromaPlane,
     rd: &MbRdCtx,
-) -> (IntraUvMode, [u8; 64], [u8; 64]) {
+) -> (IntraUvMode, [[i16; 16]; 4], [[i16; 16]; 4]) {
     const CANDIDATES: [IntraUvMode; 4] = [
         IntraUvMode::Dc,
         IntraUvMode::V,
         IntraUvMode::H,
         IntraUvMode::Tm,
     ];
-    let mut best_mode = IntraUvMode::Dc;
-    let mut best_u = [0u8; 64];
-    let mut best_v = [0u8; 64];
-    let mut best_cost = f64::INFINITY;
-    for &mode in &CANDIDATES {
+    let mut quant = [([[0i16; 16]; 4], [[0i16; 16]; 4]); 4];
+    let mut ssd = [0f64; 4];
+    let mut mode_bits = [0f64; 4];
+    let mut ranking_cost = [0f64; 4];
+    for (n, &mode) in CANDIDATES.iter().enumerate() {
         let mut u_pred = [0u8; 64];
         let mut v_pred = [0u8; 64];
         predict_uv8x8(&mut u_pred, mode, u.above, u.left, u.topleft);
@@ -3400,46 +4113,34 @@ fn pick_uv8x8_mode(
         let v_quant = transform_chroma_plane_rd(v.src, &v_pred, rd.factors, Some(rd));
         let u_recon = reconstruct_chroma_plane(&u_pred, &u_quant, rd.factors);
         let v_recon = reconstruct_chroma_plane(&v_pred, &v_quant, rd.factors);
-        let ssd = (block_ssd(&u_recon, u.src) + block_ssd(&v_recon, v.src)) as f64;
-
-        // §13.3 chroma token bits: 4 U sub-blocks (16..19) then 4 V
-        // (20..23), threading the local above/left non-zero contexts.
-        let mut above = MbEntropyCtx::default();
-        let mut left = MbEntropyCtx::default();
-        let mut token_bits = 0.0;
-        for (i, blk) in u_quant.iter().enumerate() {
-            let scan = raster_to_scan(blk);
-            token_bits += estimate_block_bits_with_ctx(
-                16 + i,
-                BlockType::UV,
-                rd.coeff_probs,
-                &scan,
-                &mut above,
-                &mut left,
-            );
-        }
-        for (i, blk) in v_quant.iter().enumerate() {
-            let scan = raster_to_scan(blk);
-            token_bits += estimate_block_bits_with_ctx(
-                20 + i,
-                BlockType::UV,
-                rd.coeff_probs,
-                &scan,
-                &mut above,
-                &mut left,
-            );
-        }
-        let mode_bits = treed_bits_cached(&*UV_MODE_PATHS, |i| KF_UV_MODE_PROB[i], mode.leaf());
-        let cost = ssd + rd.lambda * (token_bits + mode_bits);
-
-        if cost < best_cost {
-            best_cost = cost;
-            best_mode = mode;
-            best_u = u_pred;
-            best_v = v_pred;
-        }
+        ssd[n] = (block_ssd(&u_recon, u.src) + block_ssd(&v_recon, v.src)) as f64;
+        mode_bits[n] = treed_bits_cached(&*UV_MODE_PATHS, |i| KF_UV_MODE_PROB[i], mode.leaf());
+        let token_bits = estimate_chroma_bits(rd, &u_quant, &v_quant, true);
+        ranking_cost[n] = ssd[n] + rd.lambda * (token_bits + mode_bits[n]);
+        quant[n] = (u_quant, v_quant);
     }
-    (best_mode, best_u, best_v)
+    let (leader, decisive) = decisive_minimum(&ranking_cost);
+    let winner = if decisive {
+        leader
+    } else {
+        // Too close to call on the ranking estimate: the reference
+        // search — first strictly smaller reference cost wins.
+        let reference_cost = |n: usize| {
+            let token_bits = estimate_chroma_bits(rd, &quant[n].0, &quant[n].1, false);
+            ssd[n] + rd.lambda * (token_bits + mode_bits[n])
+        };
+        let mut winner = 0usize;
+        let mut best_cost = reference_cost(0);
+        for n in 1..CANDIDATES.len() {
+            let cost = reference_cost(n);
+            if cost < best_cost {
+                best_cost = cost;
+                winner = n;
+            }
+        }
+        winner
+    };
+    (CANDIDATES[winner], quant[winner].0, quant[winner].1)
 }
 
 // ─────────────────────── §11.3 / §12.3 B_PRED luma picker ──────────────────────
@@ -3601,17 +4302,40 @@ fn encode_bpred_luma(
             } else {
                 sub_modes[i * 4 + (j - 1)]
             };
-            let prob_row = &KF_BMODE_PROB[above_mode.idx()][left_mode.idx()];
+            let mode_bits_row = &KF_BMODE_BITS[above_mode.idx()][left_mode.idx()];
 
             // RD-pick the sub-mode: reconstruct each candidate, score
-            // SSD + lambda*(token bits + mode bits).
-            let mut best_mode = IntraBmode::Dc;
-            let mut best_coeffs = [0i16; 16];
-            let mut best_recon = [0u8; 16];
-            let mut best_cost = f64::INFINITY;
-            for &mode in &BMODE_CANDIDATES {
+            // SSD + lambda*(token bits + mode bits). The token bits are
+            // first taken from the pre-summed ranking estimate; the
+            // reference estimate prices the winner (and re-decides the
+            // sub-block when the ranking is too close to call).
+            let mut cand_coeffs = [[0i16; 16]; 10];
+            let mut cand_scan = [[0i16; 16]; 10];
+            let mut cand_recon = [[0u8; 16]; 10];
+            let mut cand_ssd = [0f64; 10];
+            let mut cand_rank_bits = [0f64; 10];
+            let mut cand_pred = [[0u8; 16]; 10];
+            let mut ranking_cost = [0f64; 10];
+            let (above_nonzero, left_nonzero) = (tok_above.nonzero[j], tok_left.nonzero[i]);
+            for (n, &mode) in BMODE_CANDIDATES.iter().enumerate() {
                 let mut pred = [0u8; 16];
                 predict_b4x4(&mut pred, mode, &above, &left, p);
+                cand_pred[n] = pred;
+                // A prediction identical to an earlier sub-mode's (flat
+                // or edge-less neighbourhoods make several modes
+                // coincide) yields the identical residual, levels,
+                // reconstruction and token bits — only the mode-signal
+                // cost differs.
+                if let Some(twin) = cand_pred[..n].iter().position(|earlier| *earlier == pred) {
+                    cand_coeffs[n] = cand_coeffs[twin];
+                    cand_scan[n] = cand_scan[twin];
+                    cand_recon[n] = cand_recon[twin];
+                    cand_ssd[n] = cand_ssd[twin];
+                    cand_rank_bits[n] = cand_rank_bits[twin];
+                    ranking_cost[n] =
+                        cand_ssd[n] + rd.lambda * (cand_rank_bits[n] + mode_bits_row[mode.idx()]);
+                    continue;
+                }
 
                 let mut residual = [0i16; 16];
                 for k in 0..16 {
@@ -3623,8 +4347,7 @@ fn encode_bpred_luma(
                     // §13 trellis: B_PRED sub-blocks are `YNoY2` (own DC,
                     // plane 3); seed the entry context from the real §13.3
                     // above/left non-zero predictors for this sub-block.
-                    let entry_ctx3 =
-                        (tok_above.nonzero[j] as usize) + (tok_left.nonzero[i] as usize);
+                    let entry_ctx3 = (above_nonzero as usize) + (left_nonzero as usize);
                     trellis_quantize_block(
                         &mut coeffs,
                         TrellisBlockSpec {
@@ -3643,24 +4366,41 @@ fn encode_bpred_luma(
                 }
 
                 let recon = reconstruct_block_4x4(&pred, &coeffs, factors.y1_dc, factors.y1_ac);
-                let ssd = block_ssd(&recon, &sb_src) as f64;
                 let scan = raster_to_scan(&coeffs);
-                let token_bits = estimate_block_bits(
-                    BlockType::YNoY2,
-                    rd.coeff_probs,
-                    tok_above.nonzero[j],
-                    tok_left.nonzero[i],
-                    &scan,
-                );
-                let mode_bits = treed_bits_cached(&*BMODE_PATHS, |k| prob_row[k], mode.idx() as u8);
-                let cost = ssd + rd.lambda * (token_bits + mode_bits);
-                if cost < best_cost {
-                    best_cost = cost;
-                    best_mode = mode;
-                    best_coeffs = coeffs;
-                    best_recon = recon;
-                }
+                let token_bits =
+                    rd.ranking_block_bits(BlockType::YNoY2, above_nonzero, left_nonzero, &scan);
+                cand_ssd[n] = block_ssd(&recon, &sb_src) as f64;
+                cand_rank_bits[n] = token_bits;
+                ranking_cost[n] =
+                    cand_ssd[n] + rd.lambda * (token_bits + mode_bits_row[mode.idx()]);
+                cand_coeffs[n] = coeffs;
+                cand_scan[n] = scan;
+                cand_recon[n] = recon;
             }
+            let reference_cost = |n: usize| {
+                let token_bits =
+                    rd.block_bits(BlockType::YNoY2, above_nonzero, left_nonzero, &cand_scan[n]);
+                cand_ssd[n] + rd.lambda * (token_bits + mode_bits_row[BMODE_CANDIDATES[n].idx()])
+            };
+            let (leader, decisive) = decisive_minimum(&ranking_cost);
+            let (winner, best_cost) = if decisive {
+                (leader, reference_cost(leader))
+            } else {
+                // The reference search: first strictly smaller cost wins.
+                let mut winner = 0usize;
+                let mut best_cost = reference_cost(0);
+                for n in 1..BMODE_CANDIDATES.len() {
+                    let cost = reference_cost(n);
+                    if cost < best_cost {
+                        best_cost = cost;
+                        winner = n;
+                    }
+                }
+                (winner, best_cost)
+            };
+            let best_mode = BMODE_CANDIDATES[winner];
+            let best_coeffs = cand_coeffs[winner];
+            let best_recon = cand_recon[winner];
             modes[idx] = best_mode;
             sub_modes[idx] = best_mode;
             y_coeffs[idx] = best_coeffs;
@@ -3843,6 +4583,139 @@ pub fn encode_mb_block_set_with_neighbors_strength(
     )
 }
 
+/// One macroblock's mode decision and quantised residual — what the
+/// frame drivers need from the per-macroblock search, without the token
+/// bytes the standalone [`EncodedMb`] entries also produce.
+struct MbAnalysis {
+    /// The 25 raw-quantised coefficient blocks ([`MbCoeffs`] layout).
+    coeffs: MbCoeffs,
+    /// Chosen luma mode (`B_PRED` or one of the four §12.2 modes).
+    y_mode: IntraYMode,
+    /// Chosen §12.2 chroma mode.
+    uv_mode: IntraUvMode,
+    /// The sixteen §12.3 sub-block modes, present iff `y_mode` is
+    /// `B_PRED`.
+    b_subblock_modes: Option<[IntraBmode; 16]>,
+    /// Number of residual blocks the §13.3 walk codes with at least one
+    /// non-zero coefficient (`0` ⇒ the macroblock is a §11.1 skip).
+    nonzero_block_count: usize,
+}
+
+impl MbAnalysis {
+    /// Bundle a decision, counting the non-zero blocks exactly as the
+    /// §13.3 walk in [`encode_mb_tokens`] reports them: the Y2 block only
+    /// off `B_PRED`, the sixteen Y blocks from their first coded position
+    /// (1 when the DC lives in Y2), and the eight chroma blocks.
+    fn from_coeffs(
+        coeffs: MbCoeffs,
+        y_mode: IntraYMode,
+        uv_mode: IntraUvMode,
+        b_subblock_modes: Option<[IntraBmode; 16]>,
+    ) -> Self {
+        let use_bpred = y_mode == IntraYMode::B;
+        let y_first = usize::from(!use_bpred);
+        let any = |block: &[i16]| block.iter().any(|&v| v != 0);
+        let nonzero_block_count = usize::from(!use_bpred && any(&coeffs.y2))
+            + coeffs.y.iter().filter(|b| any(&b[y_first..])).count()
+            + coeffs.u.iter().filter(|b| any(&b[..])).count()
+            + coeffs.v.iter().filter(|b| any(&b[..])).count();
+        MbAnalysis {
+            coeffs,
+            y_mode,
+            uv_mode,
+            b_subblock_modes,
+            nonzero_block_count,
+        }
+    }
+}
+
+/// The exhaustive per-macroblock search: every §12.2 luma mode, the
+/// §12.3 `B_PRED` pass with all ten sub-modes per sub-block, and every
+/// §12.2 chroma mode, each candidate carried through the full transform /
+/// trellis / reconstruction chain and scored by `J = SSD + lambda·R`.
+fn analyze_mb_exhaustive(
+    pixels: &MbPixels,
+    neighbors: &crate::reconstruct::MbNeighbors,
+    rd: &MbRdCtx,
+) -> MbAnalysis {
+    // ---- 2. Pick the §12.2 whole-block luma mode by rate-distortion.
+    //         Each candidate is reconstructed through the full §14 chain
+    //         (predict → FDCT → Y2/WHT → quant → dequant → IDCT → add),
+    //         so the distortion term is the exact self-decode SSD and the
+    //         rate term is the §13.3 token bits + §11.2 mode bits. The
+    //         shared `predict_*` kernels apply each mode's off-frame
+    //         default (V → 127, H → 129, TM → 129, DC → 128 fill) for any
+    //         `None` edge, identically on both sides, so the residual the
+    //         picker scores is the one the decoder reconstructs. The
+    //         corner (-1,-1) read only by TM_PRED defaults to the §12
+    //         `DEFAULT_ABOVE_PIXEL` (127) when off-frame, mirroring
+    //         `decode_keyframe_mb_non_bpred`.
+    let default_corner = crate::intra_predict::DEFAULT_ABOVE_PIXEL;
+    let whole = pick_y16x16_mode(
+        &pixels.y,
+        neighbors.y_above.as_ref(),
+        neighbors.y_left.as_ref(),
+        neighbors.y_topleft.unwrap_or(default_corner),
+        rd,
+    );
+
+    // ---- 2b. Score the §11.3 / §12.3 B_PRED per-4×4-sub-block luma pass
+    //          and decide luma by RD cost. The §11.2 luma-mode flag
+    //          differs between the two paths, so add each path's
+    //          mode-signal bits to its residual RD cost before comparing:
+    //          the whole-block cost already folds its mode bits inside
+    //          `pick_y16x16_mode`, and we charge the B_PRED MB its §11.2
+    //          B-flag here (its per-sub-block mode bits are already inside
+    //          `encode_bpred_luma`'s RD cost). B_PRED wins iff its total
+    //          RD cost is strictly lower.
+    let bpred = encode_bpred_luma(&pixels.y, neighbors, rd);
+    let bpred_flag_bits =
+        treed_bits_cached(&*KF_YMODE_PATHS, |i| KF_YMODE_PROB[i], IntraYMode::B.leaf());
+    let bpred_total_cost = bpred.rd_cost + rd.lambda * bpred_flag_bits;
+    let use_bpred = bpred_total_cost < whole.rd_cost;
+    let y_mode = if use_bpred { IntraYMode::B } else { whole.mode };
+
+    let (uv_mode, u_coeffs, v_coeffs) = pick_uv8x8_mode(
+        &ChromaPlane {
+            src: &pixels.u,
+            above: neighbors.u_above.as_ref(),
+            left: neighbors.u_left.as_ref(),
+            topleft: neighbors.u_topleft.unwrap_or(default_corner),
+        },
+        &ChromaPlane {
+            src: &pixels.v,
+            above: neighbors.v_above.as_ref(),
+            left: neighbors.v_left.as_ref(),
+            topleft: neighbors.v_topleft.unwrap_or(default_corner),
+        },
+        rd,
+    );
+
+    // ---- 3. Assemble the quantised coefficients from the winning modes.
+    //         The pickers already ran the §14 FDCT / Y2-WHT / quant chain
+    //         for their winner, so the luma blocks are reused directly:
+    //   * whole-block: `whole.y_coeffs` (DC in Y2) + `whole.y2_coeffs`;
+    //   * B_PRED: `bpred.y_coeffs` (each sub-block carries its own DC),
+    //     Y2 stays zero (§13 / §14.2: a B_PRED MB has no Y2 block).
+    //         The chroma blocks are the chroma picker's winner.
+    let mut raw_coeffs = MbCoeffs::default();
+    if use_bpred {
+        raw_coeffs.y = bpred.y_coeffs;
+    } else {
+        raw_coeffs.y = whole.y_coeffs;
+        raw_coeffs.y2 = whole.y2_coeffs;
+    }
+    raw_coeffs.u = u_coeffs;
+    raw_coeffs.v = v_coeffs;
+
+    MbAnalysis::from_coeffs(
+        raw_coeffs,
+        y_mode,
+        uv_mode,
+        use_bpred.then_some(bpred.modes),
+    )
+}
+
 /// [`encode_mb_block_set_with_neighbors_strength`] with an optional
 /// per-frame [`TrellisRateTables`] built for `coeff_probs`. The
 /// frame-level drivers pass `Some` so the §13 trellis prices tokens from
@@ -3868,96 +4741,14 @@ fn encode_mb_block_set_with_neighbors_strength_rates(
         lambda: rd_lambda(&factors),
         trellis,
     };
-
-    // ---- 2. Pick the §12.2 whole-block luma mode by rate-distortion.
-    //         Each candidate is reconstructed through the full §14 chain
-    //         (predict → FDCT → Y2/WHT → quant → dequant → IDCT → add),
-    //         so the distortion term is the exact self-decode SSD and the
-    //         rate term is the §13.3 token bits + §11.2 mode bits. The
-    //         shared `predict_*` kernels apply each mode's off-frame
-    //         default (V → 127, H → 129, TM → 129, DC → 128 fill) for any
-    //         `None` edge, identically on both sides, so the residual the
-    //         picker scores is the one the decoder reconstructs. The
-    //         corner (-1,-1) read only by TM_PRED defaults to the §12
-    //         `DEFAULT_ABOVE_PIXEL` (127) when off-frame, mirroring
-    //         `decode_keyframe_mb_non_bpred`.
-    let default_corner = crate::intra_predict::DEFAULT_ABOVE_PIXEL;
-    let whole = pick_y16x16_mode(
-        &pixels.y,
-        neighbors.y_above.as_ref(),
-        neighbors.y_left.as_ref(),
-        neighbors.y_topleft.unwrap_or(default_corner),
-        &rd,
-    );
-
-    // ---- 2b. Score the §11.3 / §12.3 B_PRED per-4×4-sub-block luma pass
-    //          and decide luma by RD cost. The §11.2 luma-mode flag
-    //          differs between the two paths, so add each path's
-    //          mode-signal bits to its residual RD cost before comparing:
-    //          the whole-block cost already folds its mode bits inside
-    //          `pick_y16x16_mode`, and we charge the B_PRED MB its §11.2
-    //          B-flag here (its per-sub-block mode bits are already inside
-    //          `encode_bpred_luma`'s RD cost). B_PRED wins iff its total
-    //          RD cost is strictly lower.
-    let bpred = encode_bpred_luma(&pixels.y, neighbors, &rd);
-    let bpred_flag_bits =
-        treed_bits_cached(&*KF_YMODE_PATHS, |i| KF_YMODE_PROB[i], IntraYMode::B.leaf());
-    let bpred_total_cost = bpred.rd_cost + rd.lambda * bpred_flag_bits;
-    let use_bpred = bpred_total_cost < whole.rd_cost;
-    let y_mode = if use_bpred { IntraYMode::B } else { whole.mode };
-
-    let (uv_mode, _u_pred, _v_pred) = pick_uv8x8_mode(
-        &ChromaPlane {
-            src: &pixels.u,
-            above: neighbors.u_above.as_ref(),
-            left: neighbors.u_left.as_ref(),
-            topleft: neighbors.u_topleft.unwrap_or(default_corner),
-        },
-        &ChromaPlane {
-            src: &pixels.v,
-            above: neighbors.v_above.as_ref(),
-            left: neighbors.v_left.as_ref(),
-            topleft: neighbors.v_topleft.unwrap_or(default_corner),
-        },
-        &rd,
-    );
-    // Re-derive the chosen chroma mode's predictions + quantised blocks.
-    let mut u_pred = [0u8; 64];
-    let mut v_pred = [0u8; 64];
-    predict_uv8x8(
-        &mut u_pred,
+    let MbAnalysis {
+        coeffs: raw_coeffs,
+        y_mode,
         uv_mode,
-        neighbors.u_above.as_ref(),
-        neighbors.u_left.as_ref(),
-        neighbors.u_topleft.unwrap_or(default_corner),
-    );
-    predict_uv8x8(
-        &mut v_pred,
-        uv_mode,
-        neighbors.v_above.as_ref(),
-        neighbors.v_left.as_ref(),
-        neighbors.v_topleft.unwrap_or(default_corner),
-    );
-
-    // ---- 3. Assemble the quantised coefficients from the winning modes.
-    //         The pickers already ran the §14 FDCT / Y2-WHT / quant chain
-    //         for their winner, so the luma blocks are reused directly:
-    //   * whole-block: `whole.y_coeffs` (DC in Y2) + `whole.y2_coeffs`;
-    //   * B_PRED: `bpred.y_coeffs` (each sub-block carries its own DC),
-    //     Y2 stays zero (§13 / §14.2: a B_PRED MB has no Y2 block).
-    //         Chroma is FDCT+quantised here against the chosen uv_mode.
-    let mut raw_coeffs = MbCoeffs::default();
-    if use_bpred {
-        raw_coeffs.y = bpred.y_coeffs;
-    } else {
-        raw_coeffs.y = whole.y_coeffs;
-        raw_coeffs.y2 = whole.y2_coeffs;
-    }
-    // Chroma is re-FDCT+quantised here against the chosen uv_mode; use the
-    // same §13 trellis the picker scored so the emitted bytes match the
-    // chosen-mode RD cost.
-    raw_coeffs.u = transform_chroma_plane_rd(&pixels.u, &u_pred, &factors, Some(&rd));
-    raw_coeffs.v = transform_chroma_plane_rd(&pixels.v, &v_pred, &factors, Some(&rd));
+        b_subblock_modes,
+        ..
+    } = analyze_mb_exhaustive(pixels, neighbors, &rd);
+    let use_bpred = y_mode == IntraYMode::B;
 
     // ---- 6. Walk §13.3 residual order, encode each block in scan
     //         order against fresh above / left predictor contexts.
@@ -3986,7 +4777,6 @@ fn encode_mb_block_set_with_neighbors_strength_rates(
     )?;
 
     let bytes = enc.finish();
-    let b_subblock_modes = if use_bpred { Some(bpred.modes) } else { None };
     Ok(EncodedMb {
         coeffs: raw_coeffs,
         bytes,
@@ -4016,8 +4806,8 @@ fn encode_mb_block_set_with_neighbors_strength_rates(
 /// frame-lived) / `left` (per row) so the §13.3 non-zero predictor
 /// state evolves macroblock-to-macroblock exactly as the decoder
 /// reconstructs it.
-fn encode_mb_tokens(
-    enc: &mut BoolEncoder,
+fn encode_mb_tokens<S: BoolSink>(
+    enc: &mut S,
     raw_coeffs: &MbCoeffs,
     use_bpred: bool,
     coeff_probs: &crate::dct_tokens::CoeffProbs,
@@ -4078,8 +4868,8 @@ fn encode_mb_tokens(
 ///
 /// This is the encoder partner of the `decode_one` closure inside
 /// `decode_mb_coeffs`; both update the predictor contexts in place.
-fn encode_block_with_ctx(
-    enc: &mut BoolEncoder,
+fn encode_block_with_ctx<S: BoolSink>(
+    enc: &mut S,
     block_index: usize,
     block_type: BlockType,
     coeff_probs: &crate::dct_tokens::CoeffProbs,
@@ -4108,7 +4898,7 @@ fn encode_block_with_ctx(
     let a_slot = ABOVE_CTX[block_index];
     let l_slot = LEFT_CTX[block_index];
 
-    let nz = encode_coeff_block(
+    let nz = encode_coeff_block_into(
         enc,
         block_type,
         coeff_probs,
@@ -4524,6 +5314,77 @@ pub struct I420Frame<'a> {
 }
 
 impl<'a> I420Frame<'a> {
+    /// Build an `I420Frame` from every field (explicit strides).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        width: u32,
+        height: u32,
+        y: &'a [u8],
+        u: &'a [u8],
+        v: &'a [u8],
+        y_stride: usize,
+        uv_stride: usize,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            y,
+            u,
+            v,
+            y_stride,
+            uv_stride,
+        }
+    }
+
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `y`.
+    #[must_use]
+    pub fn with_y(mut self, v: &'a [u8]) -> Self {
+        self.y = v;
+        self
+    }
+
+    /// Set `u`.
+    #[must_use]
+    pub fn with_u(mut self, v: &'a [u8]) -> Self {
+        self.u = v;
+        self
+    }
+
+    /// Set `v`.
+    #[must_use]
+    pub fn with_v(mut self, v: &'a [u8]) -> Self {
+        self.v = v;
+        self
+    }
+
+    /// Set `y_stride`.
+    #[must_use]
+    pub fn with_y_stride(mut self, v: usize) -> Self {
+        self.y_stride = v;
+        self
+    }
+
+    /// Set `uv_stride`.
+    #[must_use]
+    pub fn with_uv_stride(mut self, v: usize) -> Self {
+        self.uv_stride = v;
+        self
+    }
+
     /// Construct a frame whose planes are tightly packed (`y_stride =
     /// width`, `uv_stride = (width + 1) / 2`).
     pub fn packed(width: u32, height: u32, y: &'a [u8], u: &'a [u8], v: &'a [u8]) -> Self {
@@ -4573,13 +5434,28 @@ impl<'a> I420Frame<'a> {
         };
         let y0 = mb_row * 16;
         let x0 = mb_col * 16;
+        let cy0 = mb_row * 8;
+        let cx0 = mb_col * 8;
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        if x0 + 16 <= w && y0 + 16 <= h && cx0 + 8 <= cw && cy0 + 8 <= ch {
+            // Entirely inside the picture: straight row copies.
+            for r in 0..16 {
+                let src = (y0 + r) * self.y_stride + x0;
+                p.y[r * 16..r * 16 + 16].copy_from_slice(&self.y[src..src + 16]);
+            }
+            for r in 0..8 {
+                let src = (cy0 + r) * self.uv_stride + cx0;
+                p.u[r * 8..r * 8 + 8].copy_from_slice(&self.u[src..src + 8]);
+                p.v[r * 8..r * 8 + 8].copy_from_slice(&self.v[src..src + 8]);
+            }
+            return p;
+        }
         for r in 0..16 {
             for c in 0..16 {
                 p.y[r * 16 + c] = self.y_at(x0 + c, y0 + r);
             }
         }
-        let cy0 = mb_row * 8;
-        let cx0 = mb_col * 8;
         for r in 0..8 {
             for c in 0..8 {
                 p.u[r * 8 + c] = self.uv_at(cx0 + c, cy0 + r, false);
@@ -4648,6 +5524,50 @@ pub struct KeyframeParams {
     /// uses the trellis-chosen levels, so encoder↔decoder pixel lockstep
     /// holds at every strength.
     pub trellis_strength: TrellisStrength,
+}
+
+impl KeyframeParams {
+    /// Set `y_ac_qi`.
+    #[must_use]
+    pub fn with_y_ac_qi(mut self, v: u8) -> Self {
+        self.y_ac_qi = v;
+        self
+    }
+
+    /// Set `loop_filter_level`.
+    #[must_use]
+    pub fn with_loop_filter_level(mut self, v: u8) -> Self {
+        self.loop_filter_level = v;
+        self
+    }
+
+    /// Set `sharpness_level`.
+    #[must_use]
+    pub fn with_sharpness_level(mut self, v: u8) -> Self {
+        self.sharpness_level = v;
+        self
+    }
+
+    /// Set `nbr_of_dct_partitions`.
+    #[must_use]
+    pub fn with_nbr_of_dct_partitions(mut self, v: u8) -> Self {
+        self.nbr_of_dct_partitions = v;
+        self
+    }
+
+    /// Set `filter_type`.
+    #[must_use]
+    pub fn with_filter_type(mut self, v: bool) -> Self {
+        self.filter_type = v;
+        self
+    }
+
+    /// Set `trellis_strength`.
+    #[must_use]
+    pub fn with_trellis_strength(mut self, v: TrellisStrength) -> Self {
+        self.trellis_strength = v;
+        self
+    }
 }
 
 impl Default for KeyframeParams {
@@ -4996,6 +5916,22 @@ pub struct KeyframeCodingOptions {
     pub fitted_token_prob_updates: bool,
 }
 
+impl KeyframeCodingOptions {
+    /// Set `auto_loop_filter`.
+    #[must_use]
+    pub fn with_auto_loop_filter(mut self, v: bool) -> Self {
+        self.auto_loop_filter = v;
+        self
+    }
+
+    /// Set `fitted_token_prob_updates`.
+    #[must_use]
+    pub fn with_fitted_token_prob_updates(mut self, v: bool) -> Self {
+        self.fitted_token_prob_updates = v;
+        self
+    }
+}
+
 /// Generic key-frame front door combining the §9.4 auto-loop-filter
 /// selector and the §13.4 fitted token-prob-update emission behind one
 /// [`KeyframeCodingOptions`] toggle set.
@@ -5048,6 +5984,81 @@ pub fn encode_keyframe_with_reconstruction_and_coding_options(
 
     // Ship the smaller wire, always with its matching planes so a
     // streaming caller's LAST slot equals the decoder's reconstruction.
+    if bytes_fitted.len() <= bytes_default.len() {
+        Ok((bytes_fitted, planes_fitted))
+    } else {
+        Ok((bytes_default, planes_default))
+    }
+}
+
+/// Encode a key frame under [`KeyframeEncodeOptions`] — the entry point
+/// for callers that want to trade output size for encode time
+/// ([`EncodeEffort`]) or spread the encode over several threads.
+///
+/// `KeyframeEncodeOptions::default()` is byte-identical to
+/// [`encode_keyframe`]; for any options the bytes are independent of
+/// `options.threads`. Returns the bitstream only — see
+/// [`encode_keyframe_with_reconstruction_and_options`] for the planes.
+///
+/// ```
+/// use oxideav_vp8::{
+///     EncodeEffort, I420Frame, KeyframeEncodeOptions, KeyframeParams,
+///     encode_keyframe_with_options,
+/// };
+/// # let (width, height) = (64u32, 48u32);
+/// # let y_plane = vec![128u8; (width * height) as usize];
+/// # let u_plane = vec![128u8; ((width / 2) * (height / 2)) as usize];
+/// # let v_plane = u_plane.clone();
+/// let frame = I420Frame::packed(width, height, &y_plane, &u_plane, &v_plane);
+/// let options = KeyframeEncodeOptions::new()
+///     .with_effort(EncodeEffort::Fast)
+///     .with_threads(4);
+/// let bytes = encode_keyframe_with_options(&frame, &KeyframeParams::default(), &options)?;
+/// # assert!(!bytes.is_empty());
+/// # Ok::<(), oxideav_vp8::EncodeError>(())
+/// ```
+pub fn encode_keyframe_with_options(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+    options: &KeyframeEncodeOptions,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_keyframe_with_reconstruction_and_options(frame, params, options).map(|(bytes, _)| bytes)
+}
+
+/// [`encode_keyframe_with_options`] returning both the bitstream and the
+/// macroblock-aligned post-§15 reconstruction (the planes a decoder
+/// rebuilds from those bytes).
+///
+/// With `options.fitted_token_prob_updates` the encode runs twice — once
+/// against the §13.5 defaults to collect the branch counts, once against
+/// the fitted table — and the smaller wire ships with its matching
+/// planes, exactly as
+/// [`encode_keyframe_with_reconstruction_and_coding_options`] does.
+pub fn encode_keyframe_with_reconstruction_and_options(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+    options: &KeyframeEncodeOptions,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    let (effort, threads, auto_lf) = (options.effort, options.threads, options.auto_loop_filter);
+    if !options.fitted_token_prob_updates {
+        return encode_keyframe_tuned(frame, params, None, None, auto_lf, effort, threads);
+    }
+    let mut counts = empty_branch_counts();
+    let (bytes_default, planes_default) = encode_keyframe_tuned(
+        frame,
+        params,
+        None,
+        Some(&mut counts),
+        auto_lf,
+        effort,
+        threads,
+    )?;
+    let fitted = fit_token_prob_updates(&counts, 2.0);
+    if !any_token_prob_update(&fitted) {
+        return Ok((bytes_default, planes_default));
+    }
+    let (bytes_fitted, planes_fitted) =
+        encode_keyframe_tuned(frame, params, Some(&fitted), None, auto_lf, effort, threads)?;
     if bytes_fitted.len() <= bytes_default.len() {
         Ok((bytes_fitted, planes_fitted))
     } else {
@@ -5119,6 +6130,31 @@ fn encode_keyframe_inner_lf(
     counts: Option<&mut BranchCounts>,
     auto_lf: bool,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_keyframe_tuned(
+        frame,
+        params,
+        token_updates,
+        counts,
+        auto_lf,
+        EncodeEffort::Thorough,
+        1,
+    )
+}
+
+/// The key-frame driver behind every front door: [`encode_keyframe_inner_lf`]
+/// plus the mode-search `effort` and the `threads` budget of the
+/// macroblock-row wavefront (see the `wavefront` module). `Thorough` on
+/// one thread is the historical encode; the bytes never depend on
+/// `threads`.
+fn encode_keyframe_tuned(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+    token_updates: Option<&TokenProbUpdates>,
+    counts: Option<&mut BranchCounts>,
+    auto_lf: bool,
+    effort: EncodeEffort,
+    threads: usize,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     let width = frame.width;
     let height = frame.height;
     if width == 0 || width > 0x3FFF || height == 0 || height > 0x3FFF {
@@ -5167,8 +6203,7 @@ fn encode_keyframe_inner_lf(
     // (see `TrellisRateTables`) — built once here so the per-MB mode
     // search prices tokens from lookups instead of re-walking the §13.2
     // tree per candidate. Values (and bytes) are identical either way.
-    let trellis_rate_tables =
-        (params.trellis_strength.get() > 0.0).then(|| TrellisRateTables::for_probs(&coeff_probs));
+    let trellis_rate_tables = Some(TrellisRateTables::for_probs(&coeff_probs));
     let factors = crate::dequant::MbDequantFactors::from_base_and_deltas(
         params.y_ac_qi as i32,
         0,
@@ -5192,75 +6227,40 @@ fn encode_keyframe_inner_lf(
         mb_rows,
     };
 
-    let mut modes: Vec<MacroblockModes> = Vec::with_capacity(mb_rows * mb_cols);
-    // Raw-quantised coefficients per MB (kept so the DCT partition pass
-    // can re-walk them into the shared encoder after the mode layer is
-    // written into the first partition).
-    let mut all_coeffs: Vec<MbCoeffs> = Vec::with_capacity(mb_rows * mb_cols);
-
-    for mb_row in 0..mb_rows {
-        for mb_col in 0..mb_cols {
-            let pixels = frame.extract_mb(mb_row, mb_col);
-            let neighbors = crate::frame::gather_neighbors_public(&planes, mb_row, mb_col);
-
-            // Mode pick + forward transform/quant against the genuine
-            // reconstructed neighbours.
-            let encoded = encode_mb_block_set_with_neighbors_strength_rates(
-                &pixels,
-                &neighbors,
-                params.y_ac_qi,
-                &coeff_probs,
-                trellis_rate_tables.as_ref(),
-                params.trellis_strength,
-            )
-            .map_err(EncodeError::Token)?;
-
-            // A macroblock with no non-zero residual is coded as a skip
-            // MB (§11.1): the decoder reconstructs it as pure prediction,
-            // which is exactly what zero residue produces.
-            let mb_skip_coeff = encoded.nonzero_block_count == 0;
-
-            // Dequantise a copy of the raw coefficients and reconstruct
-            // through the decoder's §14.2 / §12.3 orchestrators, writing
-            // the result back so the next MB sees real neighbours.
-            let mut dq = encoded.coeffs;
-            factors.dequantize(&mut dq);
-            let use_bpred = encoded.y_mode == IntraYMode::B;
-            let recon = if use_bpred {
-                crate::reconstruct::decode_keyframe_mb_bpred(
-                    encoded.b_subblock_modes.as_ref(),
-                    encoded.uv_mode,
-                    mb_skip_coeff,
-                    &neighbors,
-                    &dq.y,
-                    &dq.u,
-                    &dq.v,
-                )
-            } else {
-                crate::reconstruct::decode_keyframe_mb_non_bpred(
-                    encoded.y_mode,
-                    encoded.uv_mode,
-                    mb_skip_coeff,
-                    &neighbors,
-                    &dq.y2,
-                    &dq.y,
-                    &dq.u,
-                    &dq.v,
-                )
-            }
-            .map_err(EncodeError::Reconstruct)?;
-            crate::frame::write_mb_public(&mut planes, mb_row, mb_col, &recon);
-
-            modes.push(MacroblockModes {
-                segment_id: None,
-                mb_skip_coeff,
-                y_mode: encoded.y_mode,
-                subblock_modes: encoded.b_subblock_modes,
-                uv_mode: encoded.uv_mode,
-            });
-            all_coeffs.push(encoded.coeffs);
-        }
-    }
+    // ---- Macroblock analysis + §19.2 DCT partitions ----------------------
+    //
+    // Each macroblock: gather the reconstructed neighbour strips, pick
+    // the modes and quantise the residual (exhaustively, or through the
+    // cost model at a reduced effort), reconstruct through the decoder's
+    // own §14.2 / §12.3 orchestrators, and write the result back so
+    // later macroblocks predict from genuine reconstructed pixels. A
+    // macroblock with no non-zero residual is coded as a §11.1 skip.
+    //
+    // The §13.3 token data follows the analysis row by row: macroblock
+    // row `r` is coded into partition `r % N` (§20.4), each partition
+    // through its own [`BoolEncoder`] (§4 page 9 — "All partitions are
+    // decoded using separate instances of the boolean entropy decoder")
+    // finalised with its own §7.3 flush trailer; the "above" non-zero
+    // context is per column and frame-lived, the "left" context resets
+    // at each row start.
+    let search = wavefront::KeyframeSearch {
+        frame,
+        rd: MbRdCtx {
+            factors: &factors,
+            coeff_probs: &coeff_probs,
+            rate_tables: trellis_rate_tables.as_ref(),
+            lambda: rd_lambda(&factors),
+            trellis: params.trellis_strength,
+        },
+        effort,
+        mb_cols,
+        mb_rows,
+        num_partitions,
+    };
+    let analysed = wavefront::analyse_and_tokenize(&search, &mut planes, threads)?;
+    let modes = &analysed.modes;
+    let has_coeffs = &analysed.has_coeffs;
+    let dct_partitions = &analysed.partitions;
 
     // ---- §15 loop-filter post-pass --------------------------------------
     //
@@ -5283,7 +6283,8 @@ fn encode_keyframe_inner_lf(
     // "any-coded-coefficient" test that gates the inter-subblock edges
     // (steps 2 and 4); that test reduces to "any non-zero coefficient",
     // which is invariant under dequantisation by the non-zero §14.1 Q
-    // steps, so we can pass the raw quantised `all_coeffs` directly.
+    // steps, so the flag computed from the raw quantised coefficients
+    // (`has_coeffs`) is the flag the decoder derives.
     // The §15 base config (level filled in below). Segmentation off and
     // `mode_ref_lf_delta_enabled = false`, so every per-MB override is 0
     // and each MB's effective level reduces to the frame base.
@@ -5316,10 +6317,6 @@ fn encode_keyframe_inner_lf(
     // chosen values are written to the header below so the decoder runs
     // the identical §15 pass.
     let (eff_lf_level, eff_sharpness) = if auto_lf {
-        let has_coeffs: Vec<bool> = all_coeffs
-            .iter()
-            .map(crate::loop_filter::mb_has_coeffs)
-            .collect();
         let src = crate::loop_filter::SourcePlanes {
             width: width as usize,
             height: height as usize,
@@ -5329,21 +6326,14 @@ fn encode_keyframe_inner_lf(
             y_stride: frame.y_stride,
             uv_stride: frame.uv_stride,
         };
-        crate::loop_filter::select_filter_params(
-            &planes,
-            &modes,
-            &has_coeffs,
-            &lf_config,
-            &src,
-            None,
-        )
+        crate::loop_filter::select_filter_params(&planes, modes, has_coeffs, &lf_config, &src, None)
     } else {
         (params.loop_filter_level, params.sharpness_level)
     };
     lf_config.loop_filter_level = eff_lf_level;
     lf_config.sharpness_level = eff_sharpness;
     if eff_lf_level != 0 {
-        crate::loop_filter::filter_frame(&mut planes, &modes, &all_coeffs, &lf_config);
+        crate::loop_filter::filter_frame_flags(&mut planes, modes, has_coeffs, &lf_config);
     }
     // `planes` is the macroblock-aligned post-§15 reconstruction. It is
     // returned to the caller alongside the bitstream below so a
@@ -5408,7 +6398,7 @@ fn encode_keyframe_inner_lf(
     // §11 macroblock-mode layer, threading the §11.3 cross-macroblock
     // B_PRED sub-block context buffers exactly as `parse_key_frame_*`
     // reads them.
-    write_mode_layer(&mut hdr, &modes, mb_rows, mb_cols, prob_skip_false);
+    write_mode_layer(&mut hdr, modes, mb_rows, mb_cols, prob_skip_false);
 
     let first_partition = hdr.finish();
     let first_partition_size = first_partition.len();
@@ -5418,62 +6408,15 @@ fn encode_keyframe_inner_lf(
         });
     }
 
-    // ---- §19.2 DCT partition group: per-MB §13.3 token data --------------
-    //
-    // Macroblock rows are distributed round-robin across the §9.5
-    // partitions per the §20.4 row-loop: row `r` is encoded into
-    // partition `r % N`. Each partition gets its own [`BoolEncoder`]
-    // instance (§4 page 9 — "All partitions are decoded using separate
-    // instances of the boolean entropy decoder"), finalised independently
-    // with its own §7.3 4-byte flush trailer. The §13.3 above-context
-    // is column-wise and frame-lived — shared across partitions because
-    // the decoder's `decode_residuals` also keeps one above slot per
-    // column for the whole frame. The "left" context resets at every row
-    // start so it does not need to cross partitions.
-    let mut partitions: Vec<BoolEncoder> =
-        (0..num_partitions).map(|_| BoolEncoder::new()).collect();
-    // One above-context per macroblock column, frame-lived (§13.3),
-    // shared by every row irrespective of which partition that row routes
-    // to.
-    let mut above_ctx: Vec<MbEntropyCtx> = vec![MbEntropyCtx::default(); mb_cols];
-    for mb_row in 0..mb_rows {
-        // §13.3 page 65: the "left" predictor resets at the start of
-        // every macroblock row.
-        let mut left_ctx = MbEntropyCtx::default();
-        let part_idx = mb_row % num_partitions;
-        let tok = &mut partitions[part_idx];
-        for (mb_col, above_col) in above_ctx.iter_mut().enumerate() {
-            let raster = mb_row * mb_cols + mb_col;
-            let mb = &modes[raster];
-            let use_bpred = mb.y_mode == IntraYMode::B;
-            if mb.mb_skip_coeff {
-                // §13.1: a skip macroblock emits no tokens, but its
-                // predictor slots are cleared so the next macroblock's
-                // context is correct.
-                clear_skip_ctx(use_bpred, above_col, &mut left_ctx);
-                continue;
-            }
-            encode_mb_tokens(
-                tok,
-                &all_coeffs[raster],
-                use_bpred,
-                &coeff_probs,
-                above_col,
-                &mut left_ctx,
-            )
-            .map_err(EncodeError::Token)?;
-        }
-    }
     // §13.4 observed-counts side-channel (round 157). Re-walks the
-    // §13.3 token loop above with `count_keyframe_branches`, driving
+    // §13.3 token loop with `count_keyframe_branches`, driving
     // its own private above / left predictor contexts in lockstep —
     // so the recorded per-position counts are bit-for-bit the events
-    // the bytes in `partitions` just emitted. With `counts = None`
+    // the bytes in `dct_partitions` carry. With `counts = None`
     // this is a no-op.
     if let Some(c) = counts {
-        count_keyframe_branches(&modes, &all_coeffs, mb_cols, mb_rows, c);
+        count_keyframe_branches(modes, &analysed.flat_coeffs(), mb_cols, mb_rows, c);
     }
-    let dct_partitions: Vec<Vec<u8>> = partitions.into_iter().map(|p| p.finish()).collect();
     let dct_total: usize = dct_partitions.iter().map(|p| p.len()).sum();
     let size_table_len = (num_partitions - 1) * 3;
 
@@ -5501,7 +6444,7 @@ fn encode_keyframe_inner_lf(
         out.push(((sz >> 8) & 0xff) as u8);
         out.push(((sz >> 16) & 0xff) as u8);
     }
-    for part in &dct_partitions {
+    for part in dct_partitions {
         out.extend_from_slice(part);
     }
 
@@ -5520,6 +6463,7 @@ fn encode_keyframe_inner_lf(
 /// segmentation is **delta-mode** (`segment_feature_mode = 0`): each
 /// segment's `quant_delta` is added to the §9.6 `base_y_ac_qi`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AdaptiveQuantConfig {
     /// §9.6 baseline `y_ac_qi` (0..=127). Each segment's effective qindex
     /// is `clamp(base_y_ac_qi + quant_delta[seg], 0, 127)`.
@@ -5542,6 +6486,50 @@ pub struct AdaptiveQuantConfig {
     pub sharpness_level: u8,
     /// §9.4 `filter_type`: false = §15.3 normal, true = §15.2 simple.
     pub filter_type: bool,
+}
+
+impl AdaptiveQuantConfig {
+    /// Set `base_y_ac_qi`.
+    #[must_use]
+    pub fn with_base_y_ac_qi(mut self, v: u8) -> Self {
+        self.base_y_ac_qi = v;
+        self
+    }
+
+    /// Set `variance_boundaries`.
+    #[must_use]
+    pub fn with_variance_boundaries(mut self, v: [u32; 3]) -> Self {
+        self.variance_boundaries = v;
+        self
+    }
+
+    /// Set `quant_delta`.
+    #[must_use]
+    pub fn with_quant_delta(mut self, v: [i8; 4]) -> Self {
+        self.quant_delta = v;
+        self
+    }
+
+    /// Set `loop_filter_level`.
+    #[must_use]
+    pub fn with_loop_filter_level(mut self, v: u8) -> Self {
+        self.loop_filter_level = v;
+        self
+    }
+
+    /// Set `sharpness_level`.
+    #[must_use]
+    pub fn with_sharpness_level(mut self, v: u8) -> Self {
+        self.sharpness_level = v;
+        self
+    }
+
+    /// Set `filter_type`.
+    #[must_use]
+    pub fn with_filter_type(mut self, v: bool) -> Self {
+        self.filter_type = v;
+        self
+    }
 }
 
 impl Default for AdaptiveQuantConfig {
@@ -5752,12 +6740,12 @@ fn encode_keyframe_adaptive_quant_inner_lf(
     }
     // §9.3: the loop-filter feature value is a signed 6-bit magnitude —
     // reject anything outside ±63 before the walk runs.
-    if let Some(d) = segment_lf_deltas {
-        if let Some(&bad) = d.iter().find(|v| v.unsigned_abs() > 63) {
-            return Err(EncodeError::LoopFilterLevelOutOfRange {
-                value: bad.unsigned_abs(),
-            });
-        }
+    if let Some(d) = segment_lf_deltas
+        && let Some(&bad) = d.iter().find(|v| v.unsigned_abs() > 63)
+    {
+        return Err(EncodeError::LoopFilterLevelOutOfRange {
+            value: bad.unsigned_abs(),
+        });
     }
 
     let mb_cols = width.div_ceil(16) as usize;
@@ -5767,8 +6755,7 @@ fn encode_keyframe_adaptive_quant_inner_lf(
     // Per-frame §13 trellis rate tables (see `TrellisRateTables`); the
     // tables depend only on `coeff_probs`, not on the per-segment
     // quantiser factors, so one build serves every segment.
-    let trellis_rate_tables =
-        (trellis.get() > 0.0).then(|| TrellisRateTables::for_probs(&coeff_probs));
+    let trellis_rate_tables = Some(TrellisRateTables::for_probs(&coeff_probs));
 
     // §10 per-segment effective qindex + the matching §14.1 dequant
     // factors. Delta mode: q_seg = clamp(base + delta, 0, 127). The
@@ -6090,6 +7077,7 @@ fn write_mode_layer_segmented(
     // §11.3 item 3: the "above" sub-block context spans the whole frame
     // width (4 sub-blocks per MB column), initialised to B_DC_PRED.
     let mut above_subblock = vec![IntraBmode::Dc; mb_cols * 4];
+    let bmode_paths: &[TreedLeafPath] = &*BMODE_PATHS;
 
     for mb_row in 0..mb_rows {
         // §11.3 item 3: the four left predictors reset to B_DC_PRED at
@@ -6111,7 +7099,7 @@ fn write_mode_layer_segmented(
             hdr.write_bool(prob_skip_false, mb.mb_skip_coeff);
 
             // 2. Luma mode (§11.2).
-            hdr.write_treed(&KF_YMODE_TREE, |i| KF_YMODE_PROB[i], mb.y_mode.leaf());
+            hdr.write_treed_cached(&*KF_YMODE_PATHS, |i| KF_YMODE_PROB[i], mb.y_mode.leaf());
 
             // 3. Sub-block modes (§11.3 / §11.5) for B_PRED only.
             if let Some(sub) = &mb.subblock_modes {
@@ -6129,12 +7117,12 @@ fn write_mode_layer_segmented(
                         sub[row * 4 + (col - 1)]
                     };
                     let prob_row = &KF_BMODE_PROB[above.idx()][left.idx()];
-                    hdr.write_treed(&BMODE_TREE, |i| prob_row[i], sub[j].idx() as u8);
+                    hdr.write_treed_cached(bmode_paths, |i| prob_row[i], sub[j].idx() as u8);
                 }
             }
 
             // 4. Chroma mode (§11.4).
-            hdr.write_treed(&UV_MODE_TREE, |i| KF_UV_MODE_PROB[i], mb.uv_mode.leaf());
+            hdr.write_treed_cached(&*UV_MODE_PATHS, |i| KF_UV_MODE_PROB[i], mb.uv_mode.leaf());
 
             // §11.3 item 3 / 4: update the cross-macroblock context.
             match &mb.subblock_modes {
@@ -7357,13 +8345,13 @@ fn pick_mb_for_ref(
         }
     }
     let mut chosen_split: Option<SplitMvCandidate> = None;
-    if let Some(cand) = best_split {
-        if cand.j < chosen_j {
-            chosen_mode = crate::near_mv::InterMode::Split;
-            chosen_mv = cand.split_mvs[15];
-            chosen_j = cand.j;
-            chosen_split = Some(cand);
-        }
+    if let Some(cand) = best_split
+        && cand.j < chosen_j
+    {
+        chosen_mode = crate::near_mv::InterMode::Split;
+        chosen_mv = cand.split_mvs[15];
+        chosen_j = cand.j;
+        chosen_split = Some(cand);
     }
 
     // ---- §18 / §14 prediction + residual + reconstruction at the
@@ -8740,6 +9728,7 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fi
 /// `_fitted_token_prob_updates` function-name ladder for callers (like
 /// the lagged stream driver) that need the features **combined**.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct InterCodingOptions {
     /// §11 intra-within-inter picker: every MB additionally scores the
     /// 16 whole-block `(y_mode, uv_mode)` intra candidates against the
@@ -8755,6 +9744,29 @@ pub struct InterCodingOptions {
     /// Two-pass §13.4 `token_prob_update()` fit (defaults pass →
     /// [`fit_token_prob_updates`] → fitted pass → smaller wire ships).
     pub fitted_token_prob_updates: bool,
+}
+
+impl InterCodingOptions {
+    /// Set `intra_pick`.
+    #[must_use]
+    pub fn with_intra_pick(mut self, v: bool) -> Self {
+        self.intra_pick = v;
+        self
+    }
+
+    /// Set `auto_loop_filter`.
+    #[must_use]
+    pub fn with_auto_loop_filter(mut self, v: bool) -> Self {
+        self.auto_loop_filter = v;
+        self
+    }
+
+    /// Set `fitted_token_prob_updates`.
+    #[must_use]
+    pub fn with_fitted_token_prob_updates(mut self, v: bool) -> Self {
+        self.fitted_token_prob_updates = v;
+        self
+    }
 }
 
 /// Generic §16.2 multi-reference P-frame front door combining the §11
@@ -8810,6 +9822,7 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_coding_options(
 /// at its segment's quantiser, so flat segments genuinely code coarser
 /// and busy segments finer — activity-masking AQ on P-frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct InterSegmentationConfig {
     /// Three ascending luma-variance boundaries splitting macroblocks
     /// into the four segments (see
@@ -8822,6 +9835,29 @@ pub struct InterSegmentationConfig {
     /// ≤ 63). `None` omits the §9.3 loop-filter feature entirely (every
     /// MB filters at the frame base level).
     pub lf_delta: Option<[i8; 4]>,
+}
+
+impl InterSegmentationConfig {
+    /// Set `variance_boundaries`.
+    #[must_use]
+    pub fn with_variance_boundaries(mut self, v: [u32; 3]) -> Self {
+        self.variance_boundaries = v;
+        self
+    }
+
+    /// Set `quant_delta`.
+    #[must_use]
+    pub fn with_quant_delta(mut self, v: [i8; 4]) -> Self {
+        self.quant_delta = v;
+        self
+    }
+
+    /// Set `lf_delta`.
+    #[must_use]
+    pub fn with_lf_delta(mut self, v: Option<[i8; 4]>) -> Self {
+        self.lf_delta = v;
+        self
+    }
 }
 
 impl Default for InterSegmentationConfig {
@@ -8868,12 +9904,12 @@ pub fn encode_p_frame_multi_ref_adaptive_quant(
     segmentation: &InterSegmentationConfig,
     options: &InterCodingOptions,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
-    if let Some(d) = segmentation.lf_delta {
-        if let Some(&bad) = d.iter().find(|v| v.unsigned_abs() > 63) {
-            return Err(EncodeError::LoopFilterLevelOutOfRange {
-                value: bad.unsigned_abs(),
-            });
-        }
+    if let Some(d) = segmentation.lf_delta
+        && let Some(&bad) = d.iter().find(|v| v.unsigned_abs() > 63)
+    {
+        return Err(EncodeError::LoopFilterLevelOutOfRange {
+            value: bad.unsigned_abs(),
+        });
     }
     encode_p_frame_options_and_segmentation(
         frame,
@@ -8903,12 +9939,12 @@ pub(crate) fn encode_p_frame_options_and_segmentation(
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     refresh.validate()?;
     // §9.3: the loop-filter feature value is a signed 6-bit magnitude.
-    if let Some(d) = segmentation.and_then(|s| s.lf_delta) {
-        if let Some(&bad) = d.iter().find(|v| v.unsigned_abs() > 63) {
-            return Err(EncodeError::LoopFilterLevelOutOfRange {
-                value: bad.unsigned_abs(),
-            });
-        }
+    if let Some(d) = segmentation.and_then(|s| s.lf_delta)
+        && let Some(&bad) = d.iter().find(|v| v.unsigned_abs() > 63)
+    {
+        return Err(EncodeError::LoopFilterLevelOutOfRange {
+            value: bad.unsigned_abs(),
+        });
     }
 
     if !options.fitted_token_prob_updates {
@@ -9229,21 +10265,21 @@ fn encode_p_frame_multi_ref_inner_full(
             reference: ((last.mb_cols * 16) as u32, (last.mb_rows * 16) as u32),
         });
     }
-    if let Some(g) = golden {
-        if g.mb_cols != mb_cols || g.mb_rows != mb_rows {
-            return Err(EncodeError::ReferenceDimensionsMismatch {
-                source: ((mb_cols * 16) as u32, (mb_rows * 16) as u32),
-                reference: ((g.mb_cols * 16) as u32, (g.mb_rows * 16) as u32),
-            });
-        }
+    if let Some(g) = golden
+        && (g.mb_cols != mb_cols || g.mb_rows != mb_rows)
+    {
+        return Err(EncodeError::ReferenceDimensionsMismatch {
+            source: ((mb_cols * 16) as u32, (mb_rows * 16) as u32),
+            reference: ((g.mb_cols * 16) as u32, (g.mb_rows * 16) as u32),
+        });
     }
-    if let Some(a) = altref {
-        if a.mb_cols != mb_cols || a.mb_rows != mb_rows {
-            return Err(EncodeError::ReferenceDimensionsMismatch {
-                source: ((mb_cols * 16) as u32, (mb_rows * 16) as u32),
-                reference: ((a.mb_cols * 16) as u32, (a.mb_rows * 16) as u32),
-            });
-        }
+    if let Some(a) = altref
+        && (a.mb_cols != mb_cols || a.mb_rows != mb_rows)
+    {
+        return Err(EncodeError::ReferenceDimensionsMismatch {
+            source: ((mb_cols * 16) as u32, (mb_rows * 16) as u32),
+            reference: ((a.mb_cols * 16) as u32, (a.mb_rows * 16) as u32),
+        });
     }
 
     // The decoder's inter path overlays the §13.4 update payload on top
@@ -9482,7 +10518,7 @@ fn encode_p_frame_multi_ref_inner_full(
             // prob_gf_pick)`.
             let mut best: Option<PickedMbForRef> = None;
             let mut best_total_j = f64::INFINITY;
-            for (ref_frame, ref ref_planes) in available_refs.iter() {
+            for (ref_frame, ref_planes) in available_refs.iter() {
                 let luma_ref = crate::motion_search::LumaRef {
                     plane: ref_planes.y,
                     stride: ref_planes.y_stride,
@@ -9739,11 +10775,11 @@ fn encode_p_frame_multi_ref_inner_full(
     // reference / mode deltas are the effective (carried + this-frame)
     // values resolved above.
     let mut seg_lf_level = [0i16; crate::loop_filter::MAX_MB_SEGMENTS];
-    if let Some((s, _, _)) = &seg_ctx {
-        if let Some(d) = s.lf_delta {
-            for (dst, &src) in seg_lf_level.iter_mut().zip(d.iter()) {
-                *dst = i16::from(src);
-            }
+    if let Some((s, _, _)) = &seg_ctx
+        && let Some(d) = s.lf_delta
+    {
+        for (dst, &src) in seg_lf_level.iter_mut().zip(d.iter()) {
+            *dst = i16::from(src);
         }
     }
     let mut lf_config = crate::loop_filter::FrameFilterConfig {
@@ -10464,8 +11500,255 @@ mod factory {
         VideoFrame,
     };
 
-    use super::{encode_keyframe, encode_keyframe_auto_loop_filter, I420Frame, KeyframeParams};
+    use super::{
+        EncodeEffort, I420Frame, KeyframeEncodeOptions, KeyframeParams,
+        encode_keyframe_with_options,
+    };
     use crate::decoder::VP8_CODEC_ID;
+
+    /// Typed options of the registry key-frame encoder — the struct
+    /// behind the `CodecParameters::options` bag the registered factory
+    /// ([`make_encoder_from_param_options`]) parses, and the argument of
+    /// the direct [`make_encoder_with_options`] door.
+    ///
+    /// | key | kind | default | meaning |
+    /// |---|---|---|---|
+    /// | `effort` | u32 | `3` | mode-search effort, `0` fastest ..= `3` thorough ([`EncodeEffort`]) |
+    /// | `threads` | u32 | `0` | thread budget; `0` follows the `ExecutionContext` (serial when none is announced) |
+    /// | `qindex` | u32 | `32` | §9.6 `y_ac_qi`, `0..=127` |
+    /// | `quality` | f32 | `-1` | `0..=100` quality; when ≥ 0 it replaces `qindex` and also sets the trellis strength |
+    /// | `loop_filter_level` | u32 | `0` | §9.4 level, `0..=63` |
+    /// | `auto_loop_filter` | bool | `false` | RD-select the §9.4 level / sharpness per frame |
+    /// | `partitions` | u32 | `1` | §9.5 token partition count (1 / 2 / 4 / 8) |
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    #[non_exhaustive]
+    pub struct Vp8EncoderOptions {
+        /// Mode-search effort.
+        pub effort: EncodeEffort,
+        /// Thread budget; `0` follows the announced `ExecutionContext`.
+        pub threads: usize,
+        /// §9.6 `y_ac_qi` (ignored when `quality` is set).
+        pub qindex: u8,
+        /// `0..=100` quality (see [`super::quality_to_qindex`] /
+        /// [`super::quality_to_trellis_strength`]); `None` uses `qindex`.
+        pub quality: Option<f32>,
+        /// §9.4 `loop_filter_level`.
+        pub loop_filter_level: u8,
+        /// RD-select the §9.4 level / sharpness.
+        pub auto_loop_filter: bool,
+        /// §9.5 token partition count.
+        pub partitions: u8,
+    }
+
+    impl Default for Vp8EncoderOptions {
+        fn default() -> Self {
+            let keyframe = KeyframeParams::default();
+            Vp8EncoderOptions {
+                effort: EncodeEffort::Thorough,
+                threads: 0,
+                qindex: keyframe.y_ac_qi,
+                quality: None,
+                loop_filter_level: keyframe.loop_filter_level,
+                auto_loop_filter: false,
+                partitions: keyframe.nbr_of_dct_partitions,
+            }
+        }
+    }
+
+    impl Vp8EncoderOptions {
+        /// The defaults (see the table on the type).
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Set `effort`.
+        #[must_use]
+        pub fn with_effort(mut self, v: EncodeEffort) -> Self {
+            self.effort = v;
+            self
+        }
+
+        /// Set `threads`.
+        #[must_use]
+        pub fn with_threads(mut self, v: usize) -> Self {
+            self.threads = v;
+            self
+        }
+
+        /// Set `qindex`.
+        #[must_use]
+        pub fn with_qindex(mut self, v: u8) -> Self {
+            self.qindex = v;
+            self
+        }
+
+        /// Set `quality`.
+        #[must_use]
+        pub fn with_quality(mut self, v: Option<f32>) -> Self {
+            self.quality = v;
+            self
+        }
+
+        /// Set `loop_filter_level`.
+        #[must_use]
+        pub fn with_loop_filter_level(mut self, v: u8) -> Self {
+            self.loop_filter_level = v;
+            self
+        }
+
+        /// Set `auto_loop_filter`.
+        #[must_use]
+        pub fn with_auto_loop_filter(mut self, v: bool) -> Self {
+            self.auto_loop_filter = v;
+            self
+        }
+
+        /// Set `partitions`.
+        #[must_use]
+        pub fn with_partitions(mut self, v: u8) -> Self {
+            self.partitions = v;
+            self
+        }
+    }
+
+    impl oxideav_core::CodecOptionsStruct for Vp8EncoderOptions {
+        const SCHEMA: &'static [oxideav_core::OptionField] = &[
+            oxideav_core::OptionField {
+                name: "effort",
+                kind: oxideav_core::OptionKind::U32,
+                default: oxideav_core::OptionValue::U32(3),
+                help: "mode-search effort: 0 fastest, 1 fast, 2 balanced, 3 thorough",
+            },
+            oxideav_core::OptionField {
+                name: "threads",
+                kind: oxideav_core::OptionKind::U32,
+                default: oxideav_core::OptionValue::U32(0),
+                help: "thread budget (0 = follow the execution context)",
+            },
+            oxideav_core::OptionField {
+                name: "qindex",
+                kind: oxideav_core::OptionKind::U32,
+                default: oxideav_core::OptionValue::U32(32),
+                help: "quantiser index 0..=127 (lower = better)",
+            },
+            oxideav_core::OptionField {
+                name: "quality",
+                kind: oxideav_core::OptionKind::F32,
+                default: oxideav_core::OptionValue::F32(-1.0),
+                help: "quality 0..=100 (overrides qindex; negative = unset)",
+            },
+            oxideav_core::OptionField {
+                name: "loop_filter_level",
+                kind: oxideav_core::OptionKind::U32,
+                default: oxideav_core::OptionValue::U32(0),
+                help: "loop filter level 0..=63",
+            },
+            oxideav_core::OptionField {
+                name: "auto_loop_filter",
+                kind: oxideav_core::OptionKind::Bool,
+                default: oxideav_core::OptionValue::Bool(false),
+                help: "choose the loop filter level per frame",
+            },
+            oxideav_core::OptionField {
+                name: "partitions",
+                kind: oxideav_core::OptionKind::U32,
+                default: oxideav_core::OptionValue::U32(1),
+                help: "token partition count: 1, 2, 4 or 8",
+            },
+        ];
+
+        fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> Result<()> {
+            let small = |v: u32, max: u32, what: &str| {
+                if v > max {
+                    Err(Error::invalid(format!(
+                        "vp8 encoder: option '{what}' out of range (0..={max}), got {v}"
+                    )))
+                } else {
+                    Ok(v as u8)
+                }
+            };
+            match key {
+                "effort" => self.effort = EncodeEffort::from_level(small(value.as_u32()?, 3, key)?),
+                "threads" => self.threads = value.as_u32()? as usize,
+                "qindex" => self.qindex = small(value.as_u32()?, 127, key)?,
+                "quality" => {
+                    let q = value.as_f32()?;
+                    self.quality = (q >= 0.0).then_some(q);
+                }
+                "loop_filter_level" => self.loop_filter_level = small(value.as_u32()?, 63, key)?,
+                "auto_loop_filter" => self.auto_loop_filter = value.as_bool()?,
+                "partitions" => {
+                    let n = value.as_u32()?;
+                    if !matches!(n, 1 | 2 | 4 | 8) {
+                        return Err(Error::invalid(format!(
+                            "vp8 encoder: option 'partitions' must be 1, 2, 4 or 8, got {n}"
+                        )));
+                    }
+                    self.partitions = n as u8;
+                }
+                other => {
+                    return Err(Error::invalid(format!(
+                        "vp8 encoder: unknown option '{other}'"
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Build the zero-latency key-frame encoder from typed
+    /// [`Vp8EncoderOptions`] — the direct twin of the registered factory.
+    /// `Vp8EncoderOptions::default()` gives the same encoder as
+    /// [`make_encoder`].
+    pub fn make_encoder_with_options(
+        params: &CodecParameters,
+        options: &Vp8EncoderOptions,
+    ) -> Result<Box<dyn Encoder>> {
+        let (width, height, pixel_format) = validate_video_params(params)?;
+        if options.qindex > 127 {
+            return Err(Error::invalid(
+                "vp8 encoder: qindex out of range (must be 0..=127)",
+            ));
+        }
+        if options.loop_filter_level > 63 {
+            return Err(Error::invalid(
+                "vp8 encoder: loop_filter_level out of range (must be 0..=63)",
+            ));
+        }
+        if !matches!(options.partitions, 1 | 2 | 4 | 8) {
+            return Err(Error::invalid(
+                "vp8 encoder: partitions must be 1, 2, 4 or 8",
+            ));
+        }
+        let mut keyframe = KeyframeParams::default()
+            .with_y_ac_qi(options.qindex)
+            .with_loop_filter_level(options.loop_filter_level)
+            .with_nbr_of_dct_partitions(options.partitions);
+        if let Some(quality) = options.quality {
+            keyframe.y_ac_qi = super::quality_to_qindex(quality);
+            keyframe.trellis_strength = super::quality_to_trellis_strength(quality);
+        }
+        let mut encoder = build_frame_encoder_typed(
+            params,
+            width,
+            height,
+            pixel_format,
+            keyframe,
+            options.auto_loop_filter,
+        );
+        encoder.effort = options.effort;
+        encoder.option_threads = options.threads;
+        Ok(Box::new(encoder))
+    }
+
+    /// The registry's encoder factory: parse `params.options` (strictly —
+    /// an unknown key or a malformed value is an error) into
+    /// [`Vp8EncoderOptions`] and build the key-frame encoder from it. An
+    /// empty bag gives the same encoder as [`make_encoder`].
+    pub fn make_encoder_from_param_options(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+        let options = oxideav_core::parse_options::<Vp8EncoderOptions>(&params.options)?;
+        make_encoder_with_options(params, &options)
+    }
 
     /// Build a framework-side VP8 encoder bound to `params` with all
     /// defaults: `y_ac_qi = 32`, no loop filter, 1 DCT partition,
@@ -10625,6 +11908,8 @@ mod factory {
             auto_loop_filter: config.auto_loop_filter,
             fitted_token_prob_updates: true,
             intra_pick: true,
+            effort: config.effort,
+            threads: config.threads,
             ..crate::stream::AltrefStreamConfig::default()
         };
         let stream = crate::stream::Vp8AltrefStreamEncoder::new(stream_config)
@@ -10634,6 +11919,7 @@ mod factory {
             output_params,
             width,
             height,
+            stream_config,
             stream,
             time_base,
             pts_queue: VecDeque::new(),
@@ -10658,6 +11944,10 @@ mod factory {
         output_params: CodecParameters,
         width: u32,
         height: u32,
+        /// The configuration `stream` was built from — re-used to start
+        /// a fresh stream (opening with a key frame) when a
+        /// [`Frame::StreamParams`] event changes the input size.
+        stream_config: crate::stream::AltrefStreamConfig,
         stream: crate::stream::Vp8AltrefStreamEncoder,
         time_base: TimeBase,
         /// pts of pushed source frames not yet emitted as visible
@@ -10715,6 +12005,27 @@ mod factory {
             }
             let v = match frame {
                 Frame::Video(v) => v,
+                Frame::StreamParams(p) => {
+                    let (width, height) = reconfigure_target(p, self.width, self.height)?;
+                    if (width, height) != (self.width, self.height) {
+                        // Close the current lookahead group(s) at the old
+                        // size, then open a fresh stream: its first frame
+                        // is a §9.1 key frame carrying the new size.
+                        let emitted = self
+                            .stream
+                            .finish()
+                            .map_err(|e| Error::invalid(e.to_string()))?;
+                        self.enqueue(emitted);
+                        self.stream =
+                            crate::stream::Vp8AltrefStreamEncoder::new(self.stream_config)
+                                .expect("the config already built a stream");
+                        self.width = width;
+                        self.height = height;
+                        self.output_params.width = Some(width);
+                        self.output_params.height = Some(height);
+                    }
+                    return Ok(());
+                }
                 _ => return Err(Error::invalid("vp8 encoder: video frames only")),
             };
             let (y, u, vv) = packed_planes_from_video_frame(v, self.width, self.height)?;
@@ -10749,6 +12060,16 @@ mod factory {
             }
             Ok(())
         }
+
+        /// Adopt the announced thread budget for the key frames unless
+        /// the configuration named one itself (`threads > 1`). The bytes
+        /// do not depend on it.
+        fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+            if self.stream_config.threads <= 1 {
+                self.stream_config.threads = ctx.threads;
+                self.stream.set_threads(ctx.threads);
+            }
+        }
     }
 
     /// Shared constructor for the framework-side keyframe encoder adapter.
@@ -10762,6 +12083,24 @@ mod factory {
         keyframe: KeyframeParams,
         auto_lf: bool,
     ) -> Result<Box<dyn Encoder>> {
+        Ok(Box::new(build_frame_encoder_typed(
+            params,
+            width,
+            height,
+            pixel_format,
+            keyframe,
+            auto_lf,
+        )))
+    }
+
+    fn build_frame_encoder_typed(
+        params: &CodecParameters,
+        width: u32,
+        height: u32,
+        pixel_format: PixelFormat,
+        keyframe: KeyframeParams,
+        auto_lf: bool,
+    ) -> Vp8FrameEncoder {
         let mut output_params = params.clone();
         output_params.media_type = MediaType::Video;
         output_params.codec_id = CodecId::new(VP8_CODEC_ID);
@@ -10773,16 +12112,19 @@ mod factory {
             .frame_rate
             .map_or(TimeBase::new(1, 90_000), |r| TimeBase::new(r.den, r.num));
 
-        Ok(Box::new(Vp8FrameEncoder {
+        Vp8FrameEncoder {
             output_params,
             width,
             height,
             keyframe,
             auto_lf,
+            effort: EncodeEffort::Thorough,
+            option_threads: 0,
+            context_threads: 1,
             time_base,
             pending: VecDeque::new(),
             eof: false,
-        }))
+        }
     }
 
     /// Zero-latency [`oxideav_core::Encoder`] adapter around the
@@ -10800,9 +12142,32 @@ mod factory {
         /// §9.4 RD loop-filter auto-selection (per
         /// [`Vp8EncoderConfig::auto_loop_filter`]).
         auto_lf: bool,
+        /// Mode-search effort ([`Vp8EncoderOptions::effort`]).
+        effort: EncodeEffort,
+        /// Explicit thread budget from the options (`0` = none given).
+        option_threads: usize,
+        /// Thread budget announced through `set_execution_context`
+        /// (`1` until one is).
+        context_threads: usize,
         time_base: TimeBase,
         pending: VecDeque<Packet>,
         eof: bool,
+    }
+
+    impl Vp8FrameEncoder {
+        /// The per-frame speed options: the explicit `threads` option if
+        /// one was given, else the announced execution-context budget.
+        fn keyframe_options(&self) -> KeyframeEncodeOptions {
+            let threads = if self.option_threads > 0 {
+                self.option_threads
+            } else {
+                self.context_threads
+            };
+            KeyframeEncodeOptions::new()
+                .with_effort(self.effort)
+                .with_threads(threads)
+                .with_auto_loop_filter(self.auto_lf)
+        }
     }
 
     impl std::fmt::Debug for Vp8FrameEncoder {
@@ -10829,10 +12194,25 @@ mod factory {
         fn send_frame(&mut self, frame: &Frame) -> Result<()> {
             let v = match frame {
                 Frame::Video(v) => v,
+                Frame::StreamParams(p) => {
+                    // Every packet of this adapter is a key frame, so a
+                    // new size takes effect cleanly on the next frame.
+                    let (width, height) = reconfigure_target(p, self.width, self.height)?;
+                    self.width = width;
+                    self.height = height;
+                    self.output_params.width = Some(width);
+                    self.output_params.height = Some(height);
+                    return Ok(());
+                }
                 _ => return Err(Error::invalid("vp8 encoder: video frames only")),
             };
-            let bytes =
-                encode_video_frame(v, self.width, self.height, &self.keyframe, self.auto_lf)?;
+            let bytes = encode_video_frame(
+                v,
+                self.width,
+                self.height,
+                &self.keyframe,
+                &self.keyframe_options(),
+            )?;
             let mut pkt = Packet::new(0, self.time_base, bytes);
             pkt.pts = v.pts;
             pkt.dts = v.pts;
@@ -10855,6 +12235,44 @@ mod factory {
             self.eof = true;
             Ok(())
         }
+
+        /// Record the announced thread budget; it applies unless the
+        /// `threads` option named one. The bytes do not depend on it.
+        fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+            self.context_threads = ctx.threads;
+        }
+    }
+
+    /// Resolve a [`Frame::StreamParams`] event into the new input size.
+    ///
+    /// VP8 re-states the frame size on every §9.1 key frame, so a size
+    /// change is accepted (the adapters re-key on it); anything the
+    /// encoder cannot follow — a non-video description, a pixel format
+    /// other than [`PixelFormat::Yuv420P`], a size outside the §9.1
+    /// 14-bit fields — is [`Error::Unsupported`]. Fields the event leaves
+    /// `None` keep their current value.
+    fn reconfigure_target(params: &CodecParameters, width: u32, height: u32) -> Result<(u32, u32)> {
+        if params.media_type != MediaType::Video {
+            return Err(Error::unsupported(
+                "vp8 encoder: stream-params event does not describe video",
+            ));
+        }
+        if params
+            .pixel_format
+            .is_some_and(|pf| pf != PixelFormat::Yuv420P)
+        {
+            return Err(Error::unsupported(
+                "vp8 encoder: cannot switch away from PixelFormat::Yuv420P mid-stream",
+            ));
+        }
+        let width = params.width.unwrap_or(width);
+        let height = params.height.unwrap_or(height);
+        if width == 0 || height == 0 || width > 0x3FFF || height > 0x3FFF {
+            return Err(Error::unsupported(
+                "vp8 encoder: stream-params size outside the §9.1 14-bit range (1..=16383)",
+            ));
+        }
+        Ok((width, height))
     }
 
     /// Pull the three I420 planes out of `frame` as tightly-packed
@@ -10945,17 +12363,12 @@ mod factory {
         width: u32,
         height: u32,
         keyframe: &KeyframeParams,
-        auto_lf: bool,
+        options: &KeyframeEncodeOptions,
     ) -> Result<Vec<u8>> {
         let (y_packed, u_packed, v_packed) = packed_planes_from_video_frame(frame, width, height)?;
         let src = I420Frame::packed(width, height, &y_packed, &u_packed, &v_packed);
-        let bytes = if auto_lf {
-            encode_keyframe_auto_loop_filter(&src, keyframe)
-        } else {
-            encode_keyframe(&src, keyframe)
-        }
-        .map_err(|e| Error::invalid(e.to_string()))?;
-        Ok(bytes)
+        encode_keyframe_with_options(&src, keyframe, options)
+            .map_err(|e| Error::invalid(e.to_string()))
     }
 
     fn repack_plane(data: &[u8], stride: usize, w: usize, h: usize) -> Vec<u8> {
@@ -10969,7 +12382,10 @@ mod factory {
 }
 
 #[cfg(feature = "registry")]
-pub use factory::{make_encoder, make_encoder_with_qindex, make_encoder_with_quality};
+pub use factory::{
+    Vp8EncoderOptions, make_encoder, make_encoder_from_param_options, make_encoder_with_options,
+    make_encoder_with_qindex, make_encoder_with_quality,
+};
 
 // ───────────────────── 0.1.13 public-surface compatibility ─────────────────────
 //
@@ -10989,6 +12405,7 @@ pub use factory::{make_encoder, make_encoder_with_qindex, make_encoder_with_qual
 /// enum is preserved on the surface so historical configs keep
 /// compiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum LoopFilterMode {
     /// Pick `Normal` for `lf_level < SIMPLE` thresholds, `Simple`
     /// otherwise. Default in 0.1.13.
@@ -11003,7 +12420,8 @@ pub enum LoopFilterMode {
 /// Per-frame complexity hint produced by [`first_pass_analyze`] and
 /// consumed by [`Vp8TwoPassEncoder`]. The 0.1.13 release used this as
 /// the carrier for the first-pass → second-pass rate-control hand-off.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
 pub struct FrameComplexity {
     /// Source-frame index inside the GOP.
     pub frame_index: u32,
@@ -11015,9 +12433,33 @@ pub struct FrameComplexity {
     pub scene_cut: bool,
 }
 
+impl FrameComplexity {
+    /// Set `frame_index`.
+    #[must_use]
+    pub fn with_frame_index(mut self, v: u32) -> Self {
+        self.frame_index = v;
+        self
+    }
+
+    /// Set `bits_per_mb`.
+    #[must_use]
+    pub fn with_bits_per_mb(mut self, v: f32) -> Self {
+        self.bits_per_mb = v;
+        self
+    }
+
+    /// Set `scene_cut`.
+    #[must_use]
+    pub fn with_scene_cut(mut self, v: bool) -> Self {
+        self.scene_cut = v;
+        self
+    }
+}
+
 /// Encoder statistics — emitted by every `encode` call so downstream
 /// muxers can keep running rate / quality counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Vp8EncoderStats {
     /// Number of frames the encoder has produced so far.
     pub frames_encoded: u64,
@@ -11025,6 +12467,29 @@ pub struct Vp8EncoderStats {
     pub bytes_emitted: u64,
     /// Number of key frames emitted so far.
     pub keyframes_emitted: u64,
+}
+
+impl Vp8EncoderStats {
+    /// Set `frames_encoded`.
+    #[must_use]
+    pub fn with_frames_encoded(mut self, v: u64) -> Self {
+        self.frames_encoded = v;
+        self
+    }
+
+    /// Set `bytes_emitted`.
+    #[must_use]
+    pub fn with_bytes_emitted(mut self, v: u64) -> Self {
+        self.bytes_emitted = v;
+        self
+    }
+
+    /// Set `keyframes_emitted`.
+    #[must_use]
+    pub fn with_keyframes_emitted(mut self, v: u64) -> Self {
+        self.keyframes_emitted = v;
+        self
+    }
 }
 
 /// Encoder configuration knobs — the 0.1.13 public struct.
@@ -11036,6 +12501,7 @@ pub struct Vp8EncoderStats {
 /// scene-cut detection, segment-aware QP) are persisted on the struct
 /// for forward-compat but not yet exercised by the encode body.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct Vp8EncoderConfig {
     /// Base `y_ac_qi` quantiser index (§9.6, `0..=127`).
     pub qindex: u8,
@@ -11066,6 +12532,101 @@ pub struct Vp8EncoderConfig {
     /// trades PSNR for smaller output, [`TrellisStrength::OFF`] reverts to
     /// plain round-quantisation.
     pub trellis_strength: TrellisStrength,
+    /// Mode-search effort of the key frames this configuration encodes
+    /// (see [`EncodeEffort`]); inter frames run their own search and do
+    /// not consult it. Default [`EncodeEffort::Thorough`] — the
+    /// historical bytes.
+    pub effort: EncodeEffort,
+    /// Thread budget for each key frame's macroblock-row wavefront
+    /// (`0` / `1` = serial, the default). Never changes the bytes.
+    pub threads: usize,
+}
+
+impl Vp8EncoderConfig {
+    /// Set `effort`.
+    #[must_use]
+    pub fn with_effort(mut self, v: EncodeEffort) -> Self {
+        self.effort = v;
+        self
+    }
+
+    /// Set `threads`.
+    #[must_use]
+    pub fn with_threads(mut self, v: usize) -> Self {
+        self.threads = v;
+        self
+    }
+
+    /// The key-frame speed options this configuration implies.
+    fn keyframe_options(&self) -> KeyframeEncodeOptions {
+        KeyframeEncodeOptions::new()
+            .with_effort(self.effort)
+            .with_threads(self.threads)
+            .with_auto_loop_filter(self.auto_loop_filter)
+    }
+
+    /// Set `qindex`.
+    #[must_use]
+    pub fn with_qindex(mut self, v: u8) -> Self {
+        self.qindex = v;
+        self
+    }
+
+    /// Set `lf_level`.
+    #[must_use]
+    pub fn with_lf_level(mut self, v: u8) -> Self {
+        self.lf_level = v;
+        self
+    }
+
+    /// Set `lf_mode`.
+    #[must_use]
+    pub fn with_lf_mode(mut self, v: LoopFilterMode) -> Self {
+        self.lf_mode = v;
+        self
+    }
+
+    /// Set `golden_interval`.
+    #[must_use]
+    pub fn with_golden_interval(mut self, v: u32) -> Self {
+        self.golden_interval = v;
+        self
+    }
+
+    /// Set `alt_ref_interval`.
+    #[must_use]
+    pub fn with_alt_ref_interval(mut self, v: u32) -> Self {
+        self.alt_ref_interval = v;
+        self
+    }
+
+    /// Set `lookahead_window`.
+    #[must_use]
+    pub fn with_lookahead_window(mut self, v: u32) -> Self {
+        self.lookahead_window = v;
+        self
+    }
+
+    /// Set `target_bitrate_bps`.
+    #[must_use]
+    pub fn with_target_bitrate_bps(mut self, v: u32) -> Self {
+        self.target_bitrate_bps = v;
+        self
+    }
+
+    /// Set `auto_loop_filter`.
+    #[must_use]
+    pub fn with_auto_loop_filter(mut self, v: bool) -> Self {
+        self.auto_loop_filter = v;
+        self
+    }
+
+    /// Set `trellis_strength`.
+    #[must_use]
+    pub fn with_trellis_strength(mut self, v: TrellisStrength) -> Self {
+        self.trellis_strength = v;
+        self
+    }
 }
 
 impl Default for Vp8EncoderConfig {
@@ -11080,6 +12641,8 @@ impl Default for Vp8EncoderConfig {
             target_bitrate_bps: 0,
             auto_loop_filter: false,
             trellis_strength: TrellisStrength::DEFAULT,
+            effort: EncodeEffort::Thorough,
+            threads: 1,
         }
     }
 }
@@ -11129,12 +12692,8 @@ impl Vp8Encoder {
             trellis_strength: self.config.trellis_strength,
             ..KeyframeParams::default()
         };
-        let bytes = if self.config.auto_loop_filter {
-            encode_keyframe_auto_loop_filter(frame, &params)
-        } else {
-            encode_keyframe(frame, &params)
-        }
-        .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?;
+        let bytes = encode_keyframe_with_options(frame, &params, &self.config.keyframe_options())
+            .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?;
         self.stats.frames_encoded += 1;
         self.stats.keyframes_emitted += 1;
         self.stats.bytes_emitted += bytes.len() as u64;
@@ -11203,6 +12762,8 @@ impl Vp8Encoder {
             auto_loop_filter: self.config.auto_loop_filter,
             fitted_token_prob_updates: true,
             intra_pick: true,
+            effort: self.config.effort,
+            threads: self.config.threads,
             ..crate::stream::AltrefStreamConfig::default()
         };
         let mut enc = crate::stream::Vp8AltrefStreamEncoder::new(config)
@@ -11245,6 +12806,7 @@ impl Vp8Encoder {
 /// alter the emitted bytes today. A future round may use them to clamp
 /// the per-frame qindex within a bitrate envelope.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct Vp8TwoPassConfig {
     /// Underlying single-pass config used as the second-pass baseline.
     pub base: Vp8EncoderConfig,
@@ -11274,6 +12836,50 @@ pub struct Vp8TwoPassConfig {
     /// 6386 is silent on the level choice, so this is a clean-room
     /// encoder-quality knob.
     pub auto_loop_filter: bool,
+}
+
+impl Vp8TwoPassConfig {
+    /// Set `base`.
+    #[must_use]
+    pub fn with_base(mut self, v: Vp8EncoderConfig) -> Self {
+        self.base = v;
+        self
+    }
+
+    /// Set `target_bitrate_bps`.
+    #[must_use]
+    pub fn with_target_bitrate_bps(mut self, v: u32) -> Self {
+        self.target_bitrate_bps = v;
+        self
+    }
+
+    /// Set `overshoot_ratio`.
+    #[must_use]
+    pub fn with_overshoot_ratio(mut self, v: f32) -> Self {
+        self.overshoot_ratio = v;
+        self
+    }
+
+    /// Set `fps_num`.
+    #[must_use]
+    pub fn with_fps_num(mut self, v: u32) -> Self {
+        self.fps_num = v;
+        self
+    }
+
+    /// Set `fps_den`.
+    #[must_use]
+    pub fn with_fps_den(mut self, v: u32) -> Self {
+        self.fps_den = v;
+        self
+    }
+
+    /// Set `auto_loop_filter`.
+    #[must_use]
+    pub fn with_auto_loop_filter(mut self, v: bool) -> Self {
+        self.auto_loop_filter = v;
+        self
+    }
 }
 
 impl Default for Vp8TwoPassConfig {
@@ -11512,11 +13118,15 @@ impl Vp8TwoPassEncoder {
         // the wire so decoder lockstep holds either way.
         let auto_lf = self.config.auto_loop_filter;
         let (bytes, planes) = if force_key {
-            if auto_lf {
-                encode_keyframe_auto_loop_filter_with_reconstruction(frame, &params)
-            } else {
-                encode_keyframe_with_reconstruction(frame, &params)
-            }
+            encode_keyframe_with_reconstruction_and_options(
+                frame,
+                &params,
+                &self
+                    .config
+                    .base
+                    .keyframe_options()
+                    .with_auto_loop_filter(auto_lf),
+            )
             .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?
         } else {
             let reference = self
@@ -12492,6 +14102,278 @@ mod tests {
     use crate::decode_vp8;
     use crate::frame_header::Vp8FrameHeader;
 
+    /// [`TrellisRateTables::level_rate`] is bit-for-bit
+    /// [`coeff_token_bits`] over the whole §13.2 alphabet.
+    #[test]
+    fn level_rate_matches_coeff_token_bits() {
+        let probs = &crate::DEFAULT_COEFF_PROBS;
+        let tables = TrellisRateTables::for_probs(probs);
+        for plane in 0..4 {
+            for (i, &band) in COEFF_BANDS.iter().enumerate() {
+                for ctx3 in 0..3 {
+                    for pwz in [false, true] {
+                        for level in 0u32..=2114 {
+                            let want = coeff_token_bits(probs, plane, i, ctx3, pwz, level as u16);
+                            let got = TrellisRateTables::level_rate(
+                                &tables.small[plane][band],
+                                &tables.cat_path[plane][band],
+                                ctx3,
+                                pwz,
+                                level,
+                            );
+                            assert_eq!(want.to_bits(), got.to_bits());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The one-step renormalisation in [`BoolEncoder::write_bool`]
+    /// produces the same byte stream and the same final state as the
+    /// §7.3 one-bit-at-a-time loop, over skewed, balanced and extreme
+    /// probabilities and long runs of either bit (carry chains).
+    #[test]
+    fn write_bool_matches_bitwise_listing() {
+        fn write_bool_bitwise(enc: &mut BoolEncoder, prob: u8, value: bool) {
+            let split = 1 + (((enc.range - 1) * prob as u32) >> 8);
+            if value {
+                enc.bottom = enc.bottom.wrapping_add(split);
+                enc.range -= split;
+            } else {
+                enc.range = split;
+            }
+            while enc.range < 128 {
+                enc.range <<= 1;
+                if (enc.bottom >> 31) & 1 == 1 {
+                    add_one_to_output(&mut enc.out);
+                }
+                enc.bottom <<= 1;
+                enc.bit_count -= 1;
+                if enc.bit_count == 0 {
+                    enc.out.push((enc.bottom >> 24) as u8);
+                    enc.bottom &= (1 << 24) - 1;
+                    enc.bit_count = 8;
+                }
+            }
+        }
+        let mut lcg = 0x0BAD_5EEDu32;
+        let mut next = move || {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            lcg >> 8
+        };
+        for regime in 0..8 {
+            let mut fast = BoolEncoder::new();
+            let mut slow = BoolEncoder::new();
+            for n in 0..300_000u32 {
+                let r = next();
+                let (prob, value) = match regime {
+                    0 => ((r & 0xFF) as u8, r & 0x100 != 0),
+                    1 => (128, r & 1 != 0),
+                    2 => (1, r & 0xFF00 != 0),
+                    3 => (255, r & 0xFF00 == 0),
+                    4 => (1, true),
+                    5 => (255, n % 97 == 0),
+                    6 => ((r & 0xFF) as u8, true),
+                    _ => (2 + (r & 3) as u8, r & 0x700 != 0),
+                };
+                fast.write_bool(prob, value);
+                write_bool_bitwise(&mut slow, prob, value);
+                assert_eq!(
+                    (fast.range, fast.bottom, fast.bit_count),
+                    (slow.range, slow.bottom, slow.bit_count),
+                    "regime {regime} symbol {n}"
+                );
+            }
+            assert_eq!(fast.out, slow.out, "regime {regime}");
+            assert_eq!(fast.finish(), slow.finish(), "regime {regime}");
+        }
+    }
+
+    /// The pre-summed ranking estimate stays within rounding of the
+    /// reference estimate — far inside the margin [`RD_TIE_GUARD`]
+    /// assumes.
+    #[test]
+    fn presummed_estimate_tracks_reference_estimate() {
+        let probs = &crate::DEFAULT_COEFF_PROBS;
+        let tables = TrellisRateTables::for_probs(probs);
+        let mut lcg = 0x0DDB_A11Du32;
+        let mut next = move || {
+            lcg = lcg.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (lcg >> 16) as i32
+        };
+        let mut worst = 0f64;
+        for case in 0..40_000 {
+            let mut coeffs = [0i16; 16];
+            for (k, c) in coeffs.iter_mut().enumerate() {
+                *c = match case % 4 {
+                    0 => (next() % 3 - 1) as i16,
+                    1 => ((next() % 9 == 0) as i32 * (next() % 41 - 20)) as i16,
+                    2 => ((next() % 4229 - 2114) / (1 + k as i32)) as i16,
+                    _ => (next() % 4229 - 2114) as i16,
+                };
+            }
+            for block_type in [
+                BlockType::Y2,
+                BlockType::YAfterY2,
+                BlockType::YNoY2,
+                BlockType::UV,
+            ] {
+                let (above, left) = (case % 2 == 0, case % 3 == 0);
+                let reference = estimate_block_bits(block_type, probs, above, left, &coeffs);
+                let ranking =
+                    estimate_block_bits_presummed(&tables, block_type, above, left, &coeffs);
+                worst = worst.max((reference - ranking).abs());
+            }
+        }
+        assert!(worst < 1e-9, "pre-summed estimate drifted by {worst} bits");
+    }
+
+    #[test]
+    fn decisive_minimum_takes_the_first_minimum_and_flags_close_calls() {
+        assert_eq!(decisive_minimum(&[5.0, 3.0, 9.0]), (1, true));
+        assert_eq!(decisive_minimum(&[3.0, 3.0, 9.0]), (0, false));
+        assert_eq!(
+            decisive_minimum(&[3.0 + RD_TIE_GUARD / 2.0, 3.0, 9.0]),
+            (1, false)
+        );
+        assert_eq!(
+            decisive_minimum(&[3.0 + RD_TIE_GUARD * 2.0, 3.0]),
+            (1, true)
+        );
+        assert_eq!(decisive_minimum(&[7.0]), (0, true));
+    }
+
+    /// The guarded ranking search picks exactly what the reference
+    /// search picks: whole frames encode to the same bytes with every
+    /// decision forced through the reference costs.
+    #[test]
+    fn ranked_search_matches_reference_search() {
+        let (w, h) = (112usize, 80usize);
+        // Structured picture: ramps, a flat block, edges and grain, so
+        // whole-block and `B_PRED` macroblocks, identical-prediction
+        // sub-blocks and near-ties all occur.
+        let mut lcg = 0x7E57_F00Du32;
+        let mut y = vec![0u8; w * h];
+        for row in 0..h {
+            for col in 0..w {
+                lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let grain = ((lcg >> 24) % 7) as i32 - 3;
+                let mut v = (col * 2 + row) as i32 % 256;
+                if (32..64).contains(&col) && (16..48).contains(&row) {
+                    v = 90;
+                } else if col > 70 {
+                    v = if (col / 6 + row / 9) % 2 == 0 {
+                        40
+                    } else {
+                        210
+                    } + grain;
+                } else if row > 56 {
+                    v += grain * 6;
+                }
+                y[row * w + col] = v.clamp(0, 255) as u8;
+            }
+        }
+        let u: Vec<u8> = (0..(w / 2) * (h / 2))
+            .map(|i| (100 + (i % 37)) as u8)
+            .collect();
+        let v: Vec<u8> = (0..(w / 2) * (h / 2))
+            .map(|i| (150 - (i % 23)) as u8)
+            .collect();
+        let frame = I420Frame::packed(w as u32, h as u32, &y, &u, &v);
+        for qi in [0u8, 6, 20, 45, 90, 127] {
+            for strength in [0.0, 1.0, 3.0] {
+                let params = KeyframeParams::default()
+                    .with_y_ac_qi(qi)
+                    .with_trellis_strength(TrellisStrength::new(strength));
+                let ranked = encode_keyframe(&frame, &params).unwrap();
+                FORCE_REFERENCE_SEARCH.with(|f| f.set(true));
+                let reference = encode_keyframe(&frame, &params);
+                FORCE_REFERENCE_SEARCH.with(|f| f.set(false));
+                assert_eq!(ranked, reference.unwrap(), "qi {qi} strength {strength}");
+            }
+        }
+    }
+
+    /// The reciprocal-multiply level rounding equals the plain division
+    /// for every magnitude a 16-bit coefficient can take at every tabled
+    /// quantiser step (and on the division fallback above the table).
+    #[test]
+    fn rounded_level_matches_division() {
+        for q in 1u32..1100 {
+            for magnitude in 0u32..=32768 {
+                let want = (magnitude + q / 2) / q;
+                assert_eq!(
+                    rounded_level(magnitude, q),
+                    want,
+                    "magnitude {magnitude} q {q}"
+                );
+            }
+        }
+    }
+
+    /// The step-table estimator returns the bit-identical `f64` the
+    /// direct per-step walk does, across block types, neighbour contexts,
+    /// probability tables and coefficient shapes (empty, sparse, dense,
+    /// full to position 15, cat-token magnitudes).
+    #[test]
+    fn estimate_block_bits_tabled_matches_direct() {
+        let mut perturbed = crate::DEFAULT_COEFF_PROBS;
+        let mut st = 0x1357_9BDFu32;
+        for prob in perturbed.iter_mut().flatten().flatten().flatten() {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *prob = ((st >> 24) as u8).max(1);
+        }
+        let mut lcg = 0xDEAD_BEEFu32;
+        let mut next = move || {
+            lcg = lcg.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (lcg >> 16) as i32
+        };
+        let mut cases = 0usize;
+        for probs in [&crate::DEFAULT_COEFF_PROBS, &perturbed] {
+            let tables = TrellisRateTables::for_probs(probs);
+            for block_type in [
+                BlockType::Y2,
+                BlockType::YAfterY2,
+                BlockType::YNoY2,
+                BlockType::UV,
+            ] {
+                for shape in 0..6 {
+                    for _ in 0..200 {
+                        let mut coeffs = [0i16; 16];
+                        for (k, c) in coeffs.iter_mut().enumerate() {
+                            let v = match shape {
+                                0 => 0,
+                                1 => (next() % 8 == 0) as i32 * (next() % 3 - 1),
+                                2 => next() % 5 - 2,
+                                3 => next() % 2 * 2 - 1,
+                                4 => (next() % 4200 - 2100) / (1 + k as i32),
+                                _ => (next() % 3 == 0) as i32 * (next() % 140 - 70),
+                            };
+                            *c = v as i16;
+                        }
+                        for above in [false, true] {
+                            for left in [false, true] {
+                                let want =
+                                    estimate_block_bits(block_type, probs, above, left, &coeffs);
+                                let got = estimate_block_bits_tabled(
+                                    &tables, block_type, above, left, &coeffs,
+                                );
+                                assert_eq!(
+                                    want.to_bits(),
+                                    got.to_bits(),
+                                    "{block_type:?} above {above} left {left} {coeffs:?}"
+                                );
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 30_000);
+    }
+
     /// Every point of the per-frame [`TrellisRateTables`] domain must be
     /// **bit-for-bit** the value the direct reference rate call returns —
     /// under the §13.5 default table AND a deterministically perturbed
@@ -12790,7 +14672,7 @@ mod tests {
     /// once.
     #[test]
     fn partition_group_table_matches_mv_partitions() {
-        use crate::near_mv::{partition_id, MvPartition, MV_PARTITIONS};
+        use crate::near_mv::{MV_PARTITIONS, MvPartition, partition_id};
         for (p, expected_groups) in [
             (MvPartition::TopBottom, 2usize),
             (MvPartition::LeftRight, 2),
@@ -14169,7 +16051,7 @@ mod tests {
 
     // ───────── Phase 2 §13 token-encoder round-trip tests ─────────
 
-    use crate::dct_tokens::{decode_block, DEFAULT_COEFF_PROBS};
+    use crate::dct_tokens::{DEFAULT_COEFF_PROBS, decode_block};
 
     /// Encode one block with `encode_coeff_block`, then decode the
     /// emitted bytes with `decode_block`. Returns the recovered
@@ -14198,7 +16080,7 @@ mod tests {
         let expected_nz = coeffs
             .iter()
             .enumerate()
-            .filter(|(i, &v)| *i >= first && v != 0)
+            .filter(|&(i, &v)| i >= first && v != 0)
             .count();
         assert_eq!(nonzeros, expected_nz, "non-zero count mismatch");
         let bytes = enc.finish();
@@ -14496,7 +16378,7 @@ mod tests {
     use crate::dct_tokens::decode_mb_coeffs;
     use crate::dequant::MbDequantFactors;
     use crate::macroblock::{IntraBmode, IntraUvMode, IntraYMode};
-    use crate::reconstruct::{decode_keyframe_mb_bpred, decode_keyframe_mb_non_bpred, MbNeighbors};
+    use crate::reconstruct::{MbNeighbors, decode_keyframe_mb_bpred, decode_keyframe_mb_non_bpred};
 
     /// Encode a flat-color MB through `encode_mb_block_set`, decode the
     /// bytes back through the mode-aware helper (off-frame neighbours may
@@ -15682,9 +17564,11 @@ mod tests {
     #[test]
     fn two_pass_qindices_for_bitrate_empty_and_bad_base() {
         let config = Vp8TwoPassConfig::default();
-        assert!(two_pass_qindices_for_bitrate(&config, &[], 176, 144)
-            .unwrap()
-            .is_empty());
+        assert!(
+            two_pass_qindices_for_bitrate(&config, &[], 176, 144)
+                .unwrap()
+                .is_empty()
+        );
         let bad = Vp8TwoPassConfig {
             base: Vp8EncoderConfig {
                 qindex: 200,

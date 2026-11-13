@@ -14,7 +14,9 @@
 //!   3. **stream shape** — more packets than source frames (one
 //!      invisible anchor per completed multi-frame group);
 //!   4. **full framework loop** — every emitted packet decodes through
-//!      the registry-side [`Vp8Decoder`] in emission order;
+//!      the registry-side [`Vp8Decoder`] in emission order, which returns
+//!      a picture for each visible packet and none for the §9.1
+//!      `show_frame = 0` anchors;
 //!   5. **zero-lag mode** — `alt_ref_interval = 0` restores immediate
 //!      per-frame packet availability (K/P streaming, no anchors);
 //!   6. the zero-latency still-image doors (`make_encoder`,
@@ -31,7 +33,7 @@ use oxideav_core::{
     VideoFrame,
 };
 use oxideav_vp8::{
-    make_encoder, make_encoder_with_config, make_encoder_with_quality, Vp8Decoder, Vp8EncoderConfig,
+    Vp8Decoder, Vp8EncoderConfig, make_encoder, make_encoder_with_config, make_encoder_with_quality,
 };
 
 const W: u32 = 64;
@@ -91,13 +93,12 @@ fn drain(enc: &mut Box<dyn Encoder>) -> Vec<Packet> {
 
 #[test]
 fn config_path_lags_groups_and_flushes_the_tail() {
-    let config = Vp8EncoderConfig {
-        qindex: 44,
-        alt_ref_interval: 4,
-        lookahead_window: 8,
-        golden_interval: 0, // key only frame 0
-        ..Vp8EncoderConfig::default()
-    };
+    let config = Vp8EncoderConfig::default()
+        .with_qindex(44)
+        .with_alt_ref_interval(4)
+        .with_lookahead_window(8)
+        .with_golden_interval(0) // key only frame 0
+    ;
     let mut enc = make_encoder_with_config(&vp8_params(), config).expect("build");
 
     let mut packets: Vec<Packet> = Vec::new();
@@ -153,30 +154,34 @@ fn config_path_lags_groups_and_flushes_the_tail() {
         "only the key frame sets flags.keyframe"
     );
 
-    // Full framework decode loop.
+    // Full framework decode loop. The §9.1 show_frame = 0 anchors are
+    // decoded (they install ALTREF) but return no picture, so only the
+    // six visible packets yield a frame — in source pts order.
     let mut dec = Vp8Decoder::new(CodecId::new("vp8"));
+    let mut shown_pts = Vec::new();
     for (i, p) in packets.iter().enumerate() {
         dec.send_packet(p).expect("send_packet");
-        let frame = dec
-            .receive_frame()
-            .unwrap_or_else(|e| panic!("packet {i} must decode: {e:?}"));
-        match frame {
-            Frame::Video(v) => {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => {
+                assert!(p.pts.is_some(), "packet {i}: only visible packets show");
                 assert_eq!(v.planes.len(), 3, "packet {i}: I420 output");
+                shown_pts.push(v.pts.expect("visible frame keeps its pts"));
             }
-            _ => panic!("packet {i}: video frame expected"),
+            Err(Error::NeedMore) => {
+                assert!(p.pts.is_none(), "packet {i}: only anchors are hidden");
+            }
+            other => panic!("packet {i}: unexpected {other:?}"),
         }
     }
+    assert_eq!(shown_pts, visible_pts, "decoder shows the visible packets");
 }
 
 #[test]
 fn zero_alt_ref_interval_restores_immediate_packets() {
-    let config = Vp8EncoderConfig {
-        qindex: 44,
-        alt_ref_interval: 0, // no anchors, group size 1 — zero lag
-        golden_interval: 0,
-        ..Vp8EncoderConfig::default()
-    };
+    let config = Vp8EncoderConfig::default()
+        .with_qindex(44)
+        .with_alt_ref_interval(0) // no anchors, group size 1 — zero lag
+        .with_golden_interval(0);
     let mut enc = make_encoder_with_config(&vp8_params(), config).expect("build");
 
     let mut sizes = Vec::new();
@@ -207,14 +212,9 @@ fn zero_alt_ref_interval_restores_immediate_packets() {
 
 #[test]
 fn send_frame_after_flush_is_rejected() {
-    let mut enc = make_encoder_with_config(
-        &vp8_params(),
-        Vp8EncoderConfig {
-            qindex: 44,
-            ..Vp8EncoderConfig::default()
-        },
-    )
-    .expect("build");
+    let mut enc =
+        make_encoder_with_config(&vp8_params(), Vp8EncoderConfig::default().with_qindex(44))
+            .expect("build");
     enc.send_frame(&Frame::Video(video_frame(0))).expect("send");
     enc.flush().expect("flush");
     assert!(

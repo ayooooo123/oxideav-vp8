@@ -83,8 +83,8 @@
 use crate::intra_predict::DEFAULT_LEFT_PIXEL;
 use crate::macroblock::{IntraYMode, MacroblockModes};
 use crate::reconstruct::{
-    decode_keyframe_mb_bpred, decode_keyframe_mb_non_bpred, MbNeighbors, ReconstructError,
-    ReconstructedMb,
+    MbNeighbors, ReconstructError, ReconstructedMb, decode_keyframe_mb_bpred,
+    decode_keyframe_mb_non_bpred,
 };
 
 /// Pre-dequantized coefficient bundle for one macroblock, in the layout
@@ -139,6 +139,7 @@ pub struct KeyframePlanes {
 
 /// Errors surfaced by [`decode_keyframe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FrameError {
     /// The number of supplied [`MacroblockModes`] / [`MbCoeffs`] records
     /// did not equal `mb_cols * mb_rows`. Carries `(expected, got)`.

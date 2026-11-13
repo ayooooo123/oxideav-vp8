@@ -89,6 +89,7 @@ use core::fmt;
 
 /// Errors surfaced by [`Vp8CodedHeader::parse`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CodedHeaderError {
     /// The boolean decoder ran out of input partway through the
     /// header. Wraps the underlying [`BoolDecoderError`] which carries
@@ -147,7 +148,7 @@ pub struct UpdateSegmentation {
 }
 
 /// `mb_lf_adjustments()` sub-block of §19.2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MbLfAdjustments {
     /// `loop_filter_adj_enable` — top-level toggle for per-macroblock
     /// loop-filter adjustments (RFC 6386 §9.4).
@@ -166,7 +167,7 @@ pub struct MbLfAdjustments {
 }
 
 /// `quant_indices()` sub-block of §19.2 / §9.6.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QuantIndices {
     /// L(7) `y_ac_qi` — baseline dequantisation index always present.
     pub y_ac_qi: u8,
@@ -217,7 +218,8 @@ pub type MvProbUpdates = [[Option<u8>; MV_PROB_COUNT]; 2];
 ///   `prob_intra`, `prob_last`, `prob_gf` and `mv_prob_update()`
 ///   re-`init` the bool decoder at the same partition start and
 ///   replay this prefix to reach their entry point.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Vp8CodedHeader {
     /// `color_space` (key frame only). Per §9.2 only value `0`
     /// (BT.601-like) is defined; we surface the raw bit so audits can
@@ -321,6 +323,204 @@ pub struct Vp8CodedHeader {
     /// `1`) when the corresponding F was `true`, and `None` when the
     /// F was `false`.
     pub mv_prob_update: Option<MvProbUpdates>,
+}
+
+impl Vp8CodedHeader {
+    /// Set `color_space`.
+    #[must_use]
+    pub fn with_color_space(mut self, v: Option<bool>) -> Self {
+        self.color_space = v;
+        self
+    }
+
+    /// Set `clamping_type`.
+    #[must_use]
+    pub fn with_clamping_type(mut self, v: Option<bool>) -> Self {
+        self.clamping_type = v;
+        self
+    }
+
+    /// Set `segmentation_enabled`.
+    #[must_use]
+    pub fn with_segmentation_enabled(mut self, v: bool) -> Self {
+        self.segmentation_enabled = v;
+        self
+    }
+
+    /// Set `update_segmentation`.
+    #[must_use]
+    pub fn with_update_segmentation(mut self, v: Option<UpdateSegmentation>) -> Self {
+        self.update_segmentation = v;
+        self
+    }
+
+    /// Set `filter_type`.
+    #[must_use]
+    pub fn with_filter_type(mut self, v: bool) -> Self {
+        self.filter_type = v;
+        self
+    }
+
+    /// Set `loop_filter_level`.
+    #[must_use]
+    pub fn with_loop_filter_level(mut self, v: u8) -> Self {
+        self.loop_filter_level = v;
+        self
+    }
+
+    /// Set `sharpness_level`.
+    #[must_use]
+    pub fn with_sharpness_level(mut self, v: u8) -> Self {
+        self.sharpness_level = v;
+        self
+    }
+
+    /// Set `mb_lf_adjustments`.
+    #[must_use]
+    pub fn with_mb_lf_adjustments(mut self, v: MbLfAdjustments) -> Self {
+        self.mb_lf_adjustments = v;
+        self
+    }
+
+    /// Set `log2_nbr_of_dct_partitions`.
+    #[must_use]
+    pub fn with_log2_nbr_of_dct_partitions(mut self, v: u8) -> Self {
+        self.log2_nbr_of_dct_partitions = v;
+        self
+    }
+
+    /// Set `nbr_of_dct_partitions`.
+    #[must_use]
+    pub fn with_nbr_of_dct_partitions(mut self, v: u8) -> Self {
+        self.nbr_of_dct_partitions = v;
+        self
+    }
+
+    /// Set `quant_indices`.
+    #[must_use]
+    pub fn with_quant_indices(mut self, v: QuantIndices) -> Self {
+        self.quant_indices = v;
+        self
+    }
+
+    /// Set `refresh_entropy_probs`.
+    #[must_use]
+    pub fn with_refresh_entropy_probs(mut self, v: bool) -> Self {
+        self.refresh_entropy_probs = v;
+        self
+    }
+
+    /// Set `refresh_golden_frame`.
+    #[must_use]
+    pub fn with_refresh_golden_frame(mut self, v: Option<bool>) -> Self {
+        self.refresh_golden_frame = v;
+        self
+    }
+
+    /// Set `refresh_alternate_frame`.
+    #[must_use]
+    pub fn with_refresh_alternate_frame(mut self, v: Option<bool>) -> Self {
+        self.refresh_alternate_frame = v;
+        self
+    }
+
+    /// Set `copy_buffer_to_golden`.
+    #[must_use]
+    pub fn with_copy_buffer_to_golden(mut self, v: Option<u8>) -> Self {
+        self.copy_buffer_to_golden = v;
+        self
+    }
+
+    /// Set `copy_buffer_to_alternate`.
+    #[must_use]
+    pub fn with_copy_buffer_to_alternate(mut self, v: Option<u8>) -> Self {
+        self.copy_buffer_to_alternate = v;
+        self
+    }
+
+    /// Set `sign_bias_golden`.
+    #[must_use]
+    pub fn with_sign_bias_golden(mut self, v: Option<bool>) -> Self {
+        self.sign_bias_golden = v;
+        self
+    }
+
+    /// Set `sign_bias_alternate`.
+    #[must_use]
+    pub fn with_sign_bias_alternate(mut self, v: Option<bool>) -> Self {
+        self.sign_bias_alternate = v;
+        self
+    }
+
+    /// Set `refresh_last`.
+    #[must_use]
+    pub fn with_refresh_last(mut self, v: Option<bool>) -> Self {
+        self.refresh_last = v;
+        self
+    }
+
+    /// Set `token_prob_updates`.
+    #[must_use]
+    pub fn with_token_prob_updates(mut self, v: TokenProbUpdates) -> Self {
+        self.token_prob_updates = v;
+        self
+    }
+
+    /// Set `mb_no_skip_coeff`.
+    #[must_use]
+    pub fn with_mb_no_skip_coeff(mut self, v: bool) -> Self {
+        self.mb_no_skip_coeff = v;
+        self
+    }
+
+    /// Set `prob_skip_false`.
+    #[must_use]
+    pub fn with_prob_skip_false(mut self, v: Option<u8>) -> Self {
+        self.prob_skip_false = v;
+        self
+    }
+
+    /// Set `prob_intra`.
+    #[must_use]
+    pub fn with_prob_intra(mut self, v: Option<u8>) -> Self {
+        self.prob_intra = v;
+        self
+    }
+
+    /// Set `prob_last`.
+    #[must_use]
+    pub fn with_prob_last(mut self, v: Option<u8>) -> Self {
+        self.prob_last = v;
+        self
+    }
+
+    /// Set `prob_gf`.
+    #[must_use]
+    pub fn with_prob_gf(mut self, v: Option<u8>) -> Self {
+        self.prob_gf = v;
+        self
+    }
+
+    /// Set `intra_y_mode_prob_update`.
+    #[must_use]
+    pub fn with_intra_y_mode_prob_update(mut self, v: Option<[u8; 4]>) -> Self {
+        self.intra_y_mode_prob_update = v;
+        self
+    }
+
+    /// Set `intra_uv_mode_prob_update`.
+    #[must_use]
+    pub fn with_intra_uv_mode_prob_update(mut self, v: Option<[u8; 3]>) -> Self {
+        self.intra_uv_mode_prob_update = v;
+        self
+    }
+
+    /// Set `mv_prob_update`.
+    #[must_use]
+    pub fn with_mv_prob_update(mut self, v: Option<MvProbUpdates>) -> Self {
+        self.mv_prob_update = v;
+        self
+    }
 }
 
 impl Vp8CodedHeader {
@@ -1175,7 +1375,7 @@ mod tests {
         enc.write_literal(0, 3); // sharpness
         enc.write_bool(128, true); // loop_filter_adj_enable = true
         enc.write_bool(128, true); // mode_ref_lf_delta_update = true
-                                   // ref_frame deltas: (+1, none, -2, +5)
+        // ref_frame deltas: (+1, none, -2, +5)
         enc.write_bool(128, true); // present
         enc.write_literal(1, 6);
         enc.write_bool(128, false); // sign +
@@ -1227,11 +1427,11 @@ mod tests {
         enc.write_bool(128, false); // color_space
         enc.write_bool(128, false); // clamping_type
         enc.write_bool(128, true); // segmentation_enabled = true
-                                   // update_segmentation():
+        // update_segmentation():
         enc.write_bool(128, true); // update_mb_segmentation_map = 1
         enc.write_bool(128, true); // update_segment_feature_data = 1
         enc.write_bool(128, true); // segment_feature_mode = 1 (absolute)
-                                   // quantizer_update[0..4]:
+        // quantizer_update[0..4]:
         enc.write_bool(128, true);
         enc.write_literal(10, 7);
         enc.write_bool(128, false); // +10
@@ -1240,7 +1440,7 @@ mod tests {
         enc.write_bool(128, true);
         enc.write_literal(20, 7);
         enc.write_bool(128, true); // -20
-                                   // loop_filter_update[0..4]:
+        // loop_filter_update[0..4]:
         enc.write_bool(128, false);
         enc.write_bool(128, true);
         enc.write_literal(5, 6);
@@ -1295,7 +1495,7 @@ mod tests {
         enc.write_bool(128, false); // lf_adj_enable
         enc.write_literal(0, 2); // log2_dct_parts
         enc.write_literal(64, 7); // y_ac_qi
-                                  // y_dc_delta = +1
+        // y_dc_delta = +1
         enc.write_bool(128, true);
         enc.write_literal(1, 4);
         enc.write_bool(128, false);
@@ -1355,7 +1555,7 @@ mod tests {
         enc.write_bool(128, false); // refresh_golden_frame = 0
         enc.write_bool(128, true); // refresh_alternate_frame = 1
         enc.write_literal(2, 2); // copy_buffer_to_golden = 2 (alt → gold)
-                                 // (no copy_buffer_to_alternate because refresh_alt = 1)
+        // (no copy_buffer_to_alternate because refresh_alt = 1)
         enc.write_bool(128, true); // sign_bias_golden
         enc.write_bool(128, false); // sign_bias_alternate
         enc.write_bool(128, false); // refresh_entropy_probs
@@ -1662,14 +1862,14 @@ mod tests {
         assert_eq!(DEFAULT_MV_CONTEXT[0][8], 156); // short tree [6]
         assert_eq!(DEFAULT_MV_CONTEXT[0][9], 128); // bit 0
         assert_eq!(DEFAULT_MV_CONTEXT[0][18], 254); // bit 9
-                                                    // Column component:
+        // Column component:
         assert_eq!(DEFAULT_MV_CONTEXT[1][0], 164); // is_short
         assert_eq!(DEFAULT_MV_CONTEXT[1][1], 128); // sign
         assert_eq!(DEFAULT_MV_CONTEXT[1][2], 204); // short tree [0]
         assert_eq!(DEFAULT_MV_CONTEXT[1][8], 228); // short tree [6]
         assert_eq!(DEFAULT_MV_CONTEXT[1][9], 128); // bit 0
         assert_eq!(DEFAULT_MV_CONTEXT[1][18], 254); // bit 9
-                                                    // Update-probs table sanity.
+        // Update-probs table sanity.
         assert_eq!(MV_UPDATE_PROBS[0][0], 237);
         assert_eq!(MV_UPDATE_PROBS[0][18], 254);
         assert_eq!(MV_UPDATE_PROBS[1][0], 231);
@@ -1717,7 +1917,7 @@ mod tests {
                     for (t, slot) in ctx.iter_mut().enumerate() {
                         salt = salt.wrapping_mul(1103515245).wrapping_add(12345);
                         // ~1 in 5 positions carries a replacement.
-                        if (i + j + k + t + (salt >> 16) as usize) % 5 == 0 {
+                        if (i + j + k + t + (salt >> 16) as usize).is_multiple_of(5) {
                             *slot = Some(((salt >> 8) & 0xFF) as u8);
                         }
                     }
